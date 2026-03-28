@@ -889,6 +889,121 @@ static rlvkContext RLVK = { 0 };
 static rlvkState RLVK_STATE = { 0 };
 
 //----------------------------------------------------------------------------------
+// Texture registry
+//----------------------------------------------------------------------------------
+#define RLVK_MAX_TEXTURES 1024
+
+typedef struct rlvkTexture {
+    bool active;
+    VkImage image;
+    VkDeviceMemory memory;
+    VkImageView view;
+    VkSampler sampler;
+    VkDescriptorSet descriptorSet;
+    int width, height, format;
+} rlvkTexture;
+
+static rlvkTexture rlvkTextures[RLVK_MAX_TEXTURES] = { 0 };
+static unsigned int rlvkTextureCount = 0;  // Next available slot (0 = unused, 1 = default)
+
+static VkFormat rlvkGetVulkanFormat(int raylibFormat)
+{
+    switch (raylibFormat) {
+        case RL_PIXELFORMAT_UNCOMPRESSED_GRAYSCALE:     return VK_FORMAT_R8_UNORM;
+        case RL_PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA:    return VK_FORMAT_R8G8_UNORM;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R5G6B5:        return VK_FORMAT_R5G6B5_UNORM_PACK16;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8:        return VK_FORMAT_R8G8B8_UNORM;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R5G5B5A1:      return VK_FORMAT_R5G5B5A1_UNORM_PACK16;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R4G4B4A4:      return VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8:      return VK_FORMAT_R8G8B8A8_UNORM;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R32:            return VK_FORMAT_R32_SFLOAT;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32:      return VK_FORMAT_R32G32B32_SFLOAT;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32A32:   return VK_FORMAT_R32G32B32A32_SFLOAT;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R16:            return VK_FORMAT_R16_SFLOAT;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R16G16B16:      return VK_FORMAT_R16G16B16_SFLOAT;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R16G16B16A16:   return VK_FORMAT_R16G16B16A16_SFLOAT;
+        default: return VK_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+static int rlvkGetPixelSize(int raylibFormat)
+{
+    switch (raylibFormat) {
+        case RL_PIXELFORMAT_UNCOMPRESSED_GRAYSCALE:     return 1;
+        case RL_PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA:    return 2;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R5G6B5:        return 2;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8:        return 3;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R5G5B5A1:      return 2;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R4G4B4A4:      return 2;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8:      return 4;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R32:            return 4;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32:      return 12;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R32G32B32A32:   return 16;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R16:            return 2;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R16G16B16:      return 6;
+        case RL_PIXELFORMAT_UNCOMPRESSED_R16G16B16A16:   return 8;
+        default: return 4;
+    }
+}
+
+// Get component swizzle for formats that don't map 1:1 to RGBA
+static VkComponentMapping rlvkGetSwizzle(int raylibFormat)
+{
+    VkComponentMapping swizzle = {
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+        VK_COMPONENT_SWIZZLE_IDENTITY,
+    };
+
+    if (raylibFormat == RL_PIXELFORMAT_UNCOMPRESSED_GRAYSCALE) {
+        // R8 → (R, R, R, 1) — spread grayscale to RGB, alpha = 1
+        swizzle.r = VK_COMPONENT_SWIZZLE_R;
+        swizzle.g = VK_COMPONENT_SWIZZLE_R;
+        swizzle.b = VK_COMPONENT_SWIZZLE_R;
+        swizzle.a = VK_COMPONENT_SWIZZLE_ONE;
+    }
+    else if (raylibFormat == RL_PIXELFORMAT_UNCOMPRESSED_GRAY_ALPHA) {
+        // RG8 → (R, R, R, G) — gray to RGB, alpha from G channel
+        swizzle.r = VK_COMPONENT_SWIZZLE_R;
+        swizzle.g = VK_COMPONENT_SWIZZLE_R;
+        swizzle.b = VK_COMPONENT_SWIZZLE_R;
+        swizzle.a = VK_COMPONENT_SWIZZLE_G;
+    }
+
+    return swizzle;
+}
+
+// Allocate a descriptor set for a texture and update it
+static VkDescriptorSet rlvkAllocTextureDescriptor(VkImageView view, VkSampler sampler)
+{
+    VkDescriptorSet ds;
+    VkDescriptorSetAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool = RLVK.descriptorPool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &RLVK.descriptorSetLayout,
+    };
+    vkAllocateDescriptorSets(RLVK.device, &allocInfo, &ds);
+
+    VkDescriptorImageInfo imgInfo = {
+        .sampler = sampler,
+        .imageView = view,
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+    };
+    VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = ds,
+        .dstBinding = 0,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &imgInfo,
+    };
+    vkUpdateDescriptorSets(RLVK.device, 1, &write, 0, NULL);
+    return ds;
+}
+
+//----------------------------------------------------------------------------------
 // Vulkan helpers
 //----------------------------------------------------------------------------------
 static VKAPI_ATTR VkBool32 VKAPI_CALL rlvkDebugCallback(
@@ -1072,6 +1187,18 @@ static void rlvkCreateDefaultTexture(void)
         .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
     };
     vkCreateSampler(RLVK.device, &samplerInfo, NULL, &RLVK.defaultSampler);
+
+    // Register slot 0 as unused, slot 1 as default texture
+    rlvkTextureCount = 2;  // Next free slot is 2
+    rlvkTextures[1].active = true;
+    rlvkTextures[1].image = RLVK.defaultTexImage;
+    rlvkTextures[1].memory = RLVK.defaultTexMemory;
+    rlvkTextures[1].view = RLVK.defaultTexView;
+    rlvkTextures[1].sampler = RLVK.defaultSampler;
+    rlvkTextures[1].width = 1;
+    rlvkTextures[1].height = 1;
+    rlvkTextures[1].format = RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    // descriptorSet will be set after rlvkCreateDescriptors
 }
 
 static void rlvkCreateDescriptors(void)
@@ -1122,6 +1249,9 @@ static void rlvkCreateDescriptors(void)
         .pImageInfo = &imgDescInfo,
     };
     vkUpdateDescriptorSets(RLVK.device, 1, &write, 0, NULL);
+
+    // Store in texture registry
+    rlvkTextures[1].descriptorSet = RLVK.defaultTexDescriptor;
 }
 
 static void rlvkCreatePipeline(void)
@@ -2187,17 +2317,26 @@ RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
         vkCmdPushConstants(cmd, RLVK.pipelineLayout,
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(rlvkPushConstants), &pc);
 
-        // Bind default texture descriptor
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLayout,
-            0, 1, &RLVK.defaultTexDescriptor, 0, NULL);
-
         // Iterate draw calls
         int vertexOffset = 0;
+        unsigned int lastBoundTex = 0;  // Track to avoid redundant descriptor binds
         for (int i = 0; i < batch->drawCounter; i++)
         {
             int mode = batch->draws[i].mode;
             int count = batch->draws[i].vertexCount;
             if (count <= 0) continue;
+
+            // Bind texture descriptor set for this draw call
+            unsigned int texId = batch->draws[i].textureId;
+            if (texId == 0) texId = RLVK_STATE.defaultTextureId;
+            if (texId != lastBoundTex) {
+                VkDescriptorSet ds = RLVK.defaultTexDescriptor;
+                if (texId < RLVK_MAX_TEXTURES && rlvkTextures[texId].active)
+                    ds = rlvkTextures[texId].descriptorSet;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLayout,
+                    0, 1, &ds, 0, NULL);
+                lastBoundTex = texId;
+            }
 
             if (mode == RL_LINES) {
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLines);
@@ -2434,7 +2573,125 @@ RLAPI void rlDrawVertexArrayElementsInstanced(int offset, int count, const void 
 
 // Texture management
 RLAPI unsigned int rlLoadTexture(const void *data, int width, int height, int format, int mipmapCount)
-    { (void)data; (void)width; (void)height; (void)format; (void)mipmapCount; return RLVK_STATE.defaultTextureId; }
+{
+    (void)mipmapCount;
+
+    if (data == NULL || width <= 0 || height <= 0) return 0;
+    if (rlvkTextureCount >= RLVK_MAX_TEXTURES) {
+        TRACELOG(RL_LOG_ERROR, "VULKAN: Texture registry full (max=%d)", RLVK_MAX_TEXTURES);
+        return RLVK_STATE.defaultTextureId;
+    }
+
+    unsigned int id = rlvkTextureCount++;
+    rlvkTexture *tex = &rlvkTextures[id];
+    VkFormat vkFormat = rlvkGetVulkanFormat(format);
+    int pixelSize = rlvkGetPixelSize(format);
+    VkDeviceSize dataSize = (VkDeviceSize)width * height * pixelSize;
+
+    // Create image
+    VkImageCreateInfo imgInfo = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = vkFormat,
+        .extent = { (uint32_t)width, (uint32_t)height, 1 },
+        .mipLevels = 1, .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    VkResult result = vkCreateImage(RLVK.device, &imgInfo, NULL, &tex->image);
+    if (result != VK_SUCCESS) {
+        TRACELOG(RL_LOG_ERROR, "VULKAN: Failed to create image (%d) format=%d %dx%d", result, format, width, height);
+        rlvkTextureCount--;
+        return RLVK_STATE.defaultTextureId;
+    }
+
+    VkMemoryRequirements memReq;
+    vkGetImageMemoryRequirements(RLVK.device, tex->image, &memReq);
+    VkMemoryAllocateInfo allocInfo = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = memReq.size,
+        .memoryTypeIndex = rlvkFindMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+    };
+    vkAllocateMemory(RLVK.device, &allocInfo, NULL, &tex->memory);
+    vkBindImageMemory(RLVK.device, tex->image, tex->memory, 0);
+
+    // Upload via staging buffer
+    VkBuffer staging; VkDeviceMemory stagingMem;
+    rlvkCreateBuffer(dataSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &staging, &stagingMem);
+    void *mapped;
+    vkMapMemory(RLVK.device, stagingMem, 0, dataSize, 0, &mapped);
+    memcpy(mapped, data, dataSize);
+    vkUnmapMemory(RLVK.device, stagingMem);
+
+    VkCommandBuffer cmd = rlvkBeginSingleTimeCommands();
+
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = tex->image,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+        0, NULL, 0, NULL, 1, &barrier);
+
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { (uint32_t)width, (uint32_t)height, 1 },
+    };
+    vkCmdCopyBufferToImage(cmd, staging, tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+        0, NULL, 0, NULL, 1, &barrier);
+
+    rlvkEndSingleTimeCommands(cmd);
+    vkDestroyBuffer(RLVK.device, staging, NULL);
+    vkFreeMemory(RLVK.device, stagingMem, NULL);
+
+    // Image view with swizzle for special formats
+    VkImageViewCreateInfo viewInfo = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = tex->image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = vkFormat,
+        .components = rlvkGetSwizzle(format),
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+    };
+    vkCreateImageView(RLVK.device, &viewInfo, NULL, &tex->view);
+
+    // Sampler (default: linear filtering)
+    VkSamplerCreateInfo samplerInfo = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_LINEAR,
+        .minFilter = VK_FILTER_LINEAR,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+    };
+    vkCreateSampler(RLVK.device, &samplerInfo, NULL, &tex->sampler);
+
+    // Descriptor set
+    tex->descriptorSet = rlvkAllocTextureDescriptor(tex->view, tex->sampler);
+
+    tex->active = true;
+    tex->width = width;
+    tex->height = height;
+    tex->format = format;
+
+    TRACELOG(RL_LOG_INFO, "VULKAN: Texture loaded id=%u (%dx%d fmt=%d)", id, width, height, format);
+    return id;
+}
 RLAPI unsigned int rlLoadTextureDepth(int width, int height, bool useRenderBuffer) { (void)width; (void)height; (void)useRenderBuffer; return 0; }
 RLAPI unsigned int rlLoadTextureCubemap(const void *data, int size, int format, int mipmapCount) { (void)data; (void)size; (void)format; (void)mipmapCount; return 0; }
 RLAPI void rlUpdateTexture(unsigned int id, int offsetX, int offsetY, int width, int height, int format, const void *data) { (void)id; (void)offsetX; (void)offsetY; (void)width; (void)height; (void)format; (void)data; }
@@ -2442,7 +2699,19 @@ RLAPI void rlGetGlTextureFormats(int format, unsigned int *glInternalFormat, uns
     (void)format; if (glInternalFormat) *glInternalFormat = 0; if (glFormat) *glFormat = 0; if (glType) *glType = 0;
 }
 RLAPI const char *rlGetPixelFormatName(unsigned int format) { (void)format; return "UNKNOWN"; }
-RLAPI void rlUnloadTexture(unsigned int id) { (void)id; }
+RLAPI void rlUnloadTexture(unsigned int id) {
+    if (id == 0 || id >= RLVK_MAX_TEXTURES || !rlvkTextures[id].active) return;
+    if (id == RLVK_STATE.defaultTextureId) return;  // Don't unload default texture
+
+    vkDeviceWaitIdle(RLVK.device);
+    rlvkTexture *tex = &rlvkTextures[id];
+    vkFreeDescriptorSets(RLVK.device, RLVK.descriptorPool, 1, &tex->descriptorSet);
+    vkDestroySampler(RLVK.device, tex->sampler, NULL);
+    vkDestroyImageView(RLVK.device, tex->view, NULL);
+    vkDestroyImage(RLVK.device, tex->image, NULL);
+    vkFreeMemory(RLVK.device, tex->memory, NULL);
+    memset(tex, 0, sizeof(rlvkTexture));
+}
 RLAPI void rlGenTextureMipmaps(unsigned int id, int width, int height, int format, int *mipmaps) { (void)id; (void)width; (void)height; (void)format; (void)mipmaps; }
 RLAPI void *rlReadTexturePixels(unsigned int id, int width, int height, int format) { (void)id; (void)width; (void)height; (void)format; return NULL; }
 RLAPI unsigned char *rlReadScreenPixels(int width, int height) { (void)width; (void)height; return NULL; }

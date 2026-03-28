@@ -9,24 +9,27 @@ int main(void)
     while (!WindowShouldClose())
     {
         BeginDrawing();
-            ClearBackground(DARKGRAY);
+            ClearBackground(RAYWHITE);
 
-            DrawRectangle(50, 50, 200, 100, RED);
-            DrawRectangle(300, 50, 200, 100, GREEN);
-            DrawRectangle(550, 50, 200, 100, BLUE);
+            DrawText("raylib on Vulkan!", 200, 50, 40, DARKGRAY);
+            DrawText("Shapes, textures, and text working!", 150, 100, 20, LIGHTGRAY);
 
-            DrawRectangle(50, 200, 700, 200, YELLOW);
+            DrawRectangle(50, 160, 200, 80, RED);
+            DrawRectangle(300, 160, 200, 80, GREEN);
+            DrawRectangle(550, 160, 200, 80, BLUE);
+
+            DrawCircle(400, 340, 60, ORANGE);
 
             DrawTriangle(
-                (Vector2){ 400, 180 },
-                (Vector2){ 300, 350 },
-                (Vector2){ 500, 350 },
+                (Vector2){ 400, 260 },
+                (Vector2){ 340, 380 },
+                (Vector2){ 460, 380 },
                 PURPLE
             );
 
-            DrawCircle(400, 300, 80, (Color){ 255, 128, 0, 180 });
+            DrawText("Press ESC to exit", 300, 420, 15, GRAY);
 
-            DrawLine(0, 225, 800, 225, WHITE);
+            DrawFPS(10, 10);
         EndDrawing();
     }
 
