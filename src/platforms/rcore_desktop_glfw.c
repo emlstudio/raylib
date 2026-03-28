@@ -244,7 +244,9 @@ void ToggleFullscreen(void)
 
     // Try to enable GPU V-Sync, so frames are limited to screen refresh rate (60Hz -> 60 FPS)
     // NOTE: V-Sync can be enabled by graphic driver configuration
+#if !defined(GRAPHICS_API_VULKAN)
     if (FLAG_IS_SET(CORE.Window.flags, FLAG_VSYNC_HINT)) glfwSwapInterval(1);
+#endif
 }
 
 // Toggle borderless windowed mode
@@ -365,7 +367,9 @@ void SetWindowState(unsigned int flags)
     // State change: FLAG_VSYNC_HINT
     if ((FLAG_IS_SET(CORE.Window.flags, FLAG_VSYNC_HINT) != FLAG_IS_SET(flags, FLAG_VSYNC_HINT)) && FLAG_IS_SET(flags, FLAG_VSYNC_HINT))
     {
+#if !defined(GRAPHICS_API_VULKAN)
         glfwSwapInterval(1);
+#endif
         FLAG_SET(CORE.Window.flags, FLAG_VSYNC_HINT);
     }
 
@@ -480,7 +484,9 @@ void ClearWindowState(unsigned int flags)
     // State change: FLAG_VSYNC_HINT
     if ((FLAG_IS_SET(CORE.Window.flags, FLAG_VSYNC_HINT)) && (FLAG_IS_SET(flags, FLAG_VSYNC_HINT)))
     {
+#if !defined(GRAPHICS_API_VULKAN)
         glfwSwapInterval(0);
+#endif
         FLAG_CLEAR(CORE.Window.flags, FLAG_VSYNC_HINT);
     }
 
@@ -1168,7 +1174,11 @@ void DisableCursor(void)
 // Swap back buffer with front buffer (screen drawing)
 void SwapScreenBuffer(void)
 {
+#if defined(GRAPHICS_API_VULKAN)
+    rlvkEndFrame();
+#else
     glfwSwapBuffers(platform.handle);
+#endif
 }
 
 //----------------------------------------------------------------------------------
@@ -1544,6 +1554,9 @@ int InitPlatform(void)
     // with backward compatibility to older OpenGL versions
     // For example, if using OpenGL 1.1, driver can provide a 4.3 backwards compatible context
 
+#if defined(GRAPHICS_API_VULKAN)
+    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);  // No OpenGL context for Vulkan
+#else
     // Check selection OpenGL version
     if (rlGetVersion() == RL_OPENGL_21)
     {
@@ -1587,6 +1600,7 @@ int InitPlatform(void)
         glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_ES_API);
         glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
     }
+#endif // !GRAPHICS_API_VULKAN
 
     // NOTE: GLFW 3.4+ defers initialization of the Joystick subsystem on the first call to any Joystick related functions
     // Forcing this initialization here avoids doing it on PollInputEvents() called by EndDrawing() after first frame has been drawn
@@ -1691,14 +1705,21 @@ int InitPlatform(void)
         CORE.Window.render.height = CORE.Window.screen.height;
     }
 
+#if defined(GRAPHICS_API_VULKAN)
+    // For Vulkan, no GL context — initialize Vulkan instance, device, and surface
+    rlvkSetWindow(platform.handle);
+    CORE.Window.ready = true;
+#else
     glfwMakeContextCurrent(platform.handle);
     result = glfwGetError(NULL);
     if ((result != GLFW_NO_WINDOW_CONTEXT) && (result != GLFW_PLATFORM_ERROR)) CORE.Window.ready = true; // Checking context activation
+#endif
 
     if (CORE.Window.ready)
     {
         // Setup additional windows configs and register required window size info
 
+#if !defined(GRAPHICS_API_VULKAN)
         glfwSwapInterval(0); // No V-Sync by default
 
         // Try to enable GPU V-Sync, so frames are limited to screen refresh rate (60Hz -> 60 FPS)
@@ -1710,6 +1731,7 @@ int InitPlatform(void)
             glfwSwapInterval(1);
             TRACELOG(LOG_INFO, "DISPLAY: Trying to enable VSYNC");
         }
+#endif
 
         if (FLAG_IS_SET(CORE.Window.flags, FLAG_WINDOW_HIGHDPI))
         {
@@ -1798,7 +1820,9 @@ int InitPlatform(void)
 
     // Load OpenGL extensions
     // NOTE: GL procedures address loader is required to load extensions
+#if !defined(GRAPHICS_API_VULKAN)
     rlLoadExtensions(glfwGetProcAddress);
+#endif
     //----------------------------------------------------------------------------
 
     // Initialize input events callbacks

@@ -251,6 +251,7 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW)
     #GRAPHICS = GRAPHICS_API_OPENGL_21          # Uncomment to use OpenGL 2.1
     #GRAPHICS = GRAPHICS_API_OPENGL_43          # Uncomment to use OpenGL 4.3
     #GRAPHICS = GRAPHICS_API_OPENGL_ES2         # Uncomment to use OpenGL ES 2.0 (ANGLE)
+    #GRAPHICS = GRAPHICS_API_VULKAN             # Uncomment to use Vulkan
 endif
 ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_SDL)
     GRAPHICS ?= GRAPHICS_API_OPENGL_33
@@ -631,7 +632,11 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW)
         endif
     endif
     ifeq ($(PLATFORM_OS),LINUX)
-        LDLIBS = -lGL -lc -lm -lpthread -ldl -lrt
+        ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+            LDLIBS = -lvulkan -lc -lm -lpthread -ldl -lrt
+        else
+            LDLIBS = -lGL -lc -lm -lpthread -ldl -lrt
+        endif
         ifeq ($(GLFW_LINUX_ENABLE_X11),TRUE)
             LDLIBS += -lX11
         endif

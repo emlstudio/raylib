@@ -116,8 +116,13 @@
 #if defined(PLATFORM_MEMORY) || defined(PLATFORM_WEB)
     #define SW_GL_FRAMEBUFFER_COPY_BGRA false
 #endif
-#define RLGL_IMPLEMENTATION
-#include "rlgl.h"                   // OpenGL abstraction layer to OpenGL 1.1, 3.3+ or ES2
+#if defined(GRAPHICS_API_VULKAN)
+    #define RLVK_IMPLEMENTATION
+    #include "rlvk.h"              // Vulkan abstraction layer
+#else
+    #define RLGL_IMPLEMENTATION
+    #include "rlgl.h"              // OpenGL abstraction layer to OpenGL 1.1, 3.3+ or ES2
+#endif
 
 #define RAYMATH_IMPLEMENTATION
 #include "raymath.h"                // Vector2, Vector3, Quaternion and Matrix functionality
@@ -882,6 +887,10 @@ void BeginDrawing(void)
     CORE.Time.current = GetTime();      // Number of elapsed seconds since InitTimer()
     CORE.Time.update = CORE.Time.current - CORE.Time.previous;
     CORE.Time.previous = CORE.Time.current;
+
+#if defined(GRAPHICS_API_VULKAN)
+    rlvkBeginFrame();                   // Acquire swapchain image, begin render pass
+#endif
 
     rlLoadIdentity();                   // Reset current matrix (modelview)
     rlMultMatrixf(MatrixToFloat(CORE.Window.screenScale)); // Apply screen scaling
