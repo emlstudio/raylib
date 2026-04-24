@@ -297,6 +297,14 @@ endif
 #------------------------------------------------------------------------------------------------
 LDFLAGS = -L. -L$(RAYLIB_RELEASE_PATH)
 
+# Vulkan SDK paths (LunarG SDK on Windows / macOS, distro packages on Linux / BSD)
+ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+    ifneq ($(VULKAN_SDK),)
+        CFLAGS  += -I$(VULKAN_SDK)/include
+        LDFLAGS += -L$(VULKAN_SDK)/lib
+    endif
+endif
+
 ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW)
     ifeq ($(PLATFORM_OS),WINDOWS)
         # NOTE: The resource .rc file contains windows executable icon and properties
@@ -387,12 +395,20 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW)
     ifeq ($(PLATFORM_OS),WINDOWS)
         # Libraries for Windows desktop compilation
         # NOTE: WinMM library required to set high-res timer resolution
-        LDLIBS = -lraylib -lopengl32 -lgdi32 -lwinmm
+        ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+            LDLIBS = -lraylib -lvulkan-1 -lgdi32 -lwinmm
+        else
+            LDLIBS = -lraylib -lopengl32 -lgdi32 -lwinmm
+        endif
     endif
     ifeq ($(PLATFORM_OS),LINUX)
         # Libraries for Debian GNU/Linux desktop compiling
         # NOTE: Required packages: libegl1-mesa-dev
-        LDLIBS = -lraylib -lGL -lm -lpthread -ldl -lrt
+        ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+            LDLIBS = -lraylib -lvulkan -lm -lpthread -ldl -lrt
+        else
+            LDLIBS = -lraylib -lGL -lm -lpthread -ldl -lrt
+        endif
 
         # On Wayland, additional libraries requires
         ifeq ($(GLFW_LINUX_ENABLE_WAYLAND),TRUE)
@@ -416,13 +432,24 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW)
     ifeq ($(PLATFORM_OS),OSX)
         # Libraries for OSX 10.9 desktop compiling
         # NOTE: Required packages: libopenal-dev libegl1-mesa-dev
-        LDLIBS = -lraylib -framework OpenGL -framework Cocoa -framework IOKit -framework CoreAudio -framework CoreVideo
+        ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+            # NOTE: Vulkan on macOS goes through MoltenVK. VULKAN_SDK env var
+            # is set by the LunarG installer.
+            LDLIBS = -lraylib -lvulkan -framework Cocoa -framework IOKit -framework CoreAudio -framework CoreVideo
+            LDFLAGS += -Wl,-rpath,$(VULKAN_SDK)/lib
+        else
+            LDLIBS = -lraylib -framework OpenGL -framework Cocoa -framework IOKit -framework CoreAudio -framework CoreVideo
+        endif
     endif
     ifeq ($(PLATFORM_OS),BSD)
         # Libraries for FreeBSD, OpenBSD, NetBSD, DragonFly desktop compiling
         # NOTE: Required packages: mesa-libs
         LDFLAGS += -L/usr/X11R7/lib -Wl,-R/usr/X11R7/lib
-        LDLIBS = -lraylib -lGL -lm -lpthread
+        ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+            LDLIBS = -lraylib -lvulkan -lm -lpthread
+        else
+            LDLIBS = -lraylib -lGL -lm -lpthread
+        endif
 
         # On XWindow requires also below libraries
         LDLIBS += -lX11 -lXrandr -lXinerama -lXi -lXxf86vm -lXcursor

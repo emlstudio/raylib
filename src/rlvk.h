@@ -23,6 +23,8 @@
 
 #define RLGL_VERSION  "6.0-vulkan"
 
+#include "rlvk_shader.h"
+
 // Function specifiers
 #if defined(_WIN32) && defined(BUILD_LIBTYPE_SHARED)
     #define RLAPI __declspec(dllexport)

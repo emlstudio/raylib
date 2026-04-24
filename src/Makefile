@@ -299,6 +299,13 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_MEMORY)
     GRAPHICS = GRAPHICS_API_OPENGL_SOFTWARE
 endif
 
+# Phase 4 Vulkan backend supports desktop platforms only.
+ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+    ifneq ($(filter $(TARGET_PLATFORM),PLATFORM_WEB PLATFORM_WEB_RGFW PLATFORM_WEB_EMSCRIPTEN PLATFORM_ANDROID PLATFORM_DRM),)
+        $(error GRAPHICS_API_VULKAN is not supported on $(TARGET_PLATFORM) in this raylib version. Desktop platforms only (Windows / Linux / macOS / BSD). See docs/vulkan_porting_guide.md#platform-support)
+    endif
+endif
+
 # Define default C compiler and archiver to pack library: CC, AR
 #------------------------------------------------------------------------------------------------
 CC = gcc
@@ -585,6 +592,14 @@ endif
 #------------------------------------------------------------------------------------------------
 LDFLAGS = $(CUSTOM_LDFLAGS) -L. -L$(RAYLIB_RELEASE_PATH)
 
+# Vulkan SDK paths (LunarG SDK on Windows / macOS, distro packages on Linux / BSD)
+ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+    ifneq ($(VULKAN_SDK),)
+        CFLAGS  += -I$(VULKAN_SDK)/include
+        LDFLAGS += -L$(VULKAN_SDK)/lib
+    endif
+endif
+
 ifeq ($(TARGET_PLATFORM),$(filter $(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW PLATFORM_DESKTOP_SDL PLATFORM_DESKTOP_RGFW PLATFORM_DESKTOP_WIN32))
     ifeq ($(PLATFORM_OS),WINDOWS)
         ifneq ($(CC), tcc)
@@ -634,7 +649,11 @@ endif
 #------------------------------------------------------------------------------------------------
 ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW)
     ifeq ($(PLATFORM_OS),WINDOWS)
-        ifeq ($(CC), tcc)
+        ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+            # NOTE: Requires Vulkan SDK installed (sets VULKAN_SDK env var).
+            # MSYS2 users: pacman -S mingw-w64-x86_64-vulkan-devel
+            LDLIBS = -static-libgcc -lvulkan-1 -lgdi32 -lwinmm
+        else ifeq ($(CC), tcc)
             LDLIBS = -lopengl32 -lgdi32 -lwinmm -lshell32
         else
             LDLIBS = -static-libgcc -lopengl32 -lgdi32 -lwinmm
@@ -657,10 +676,21 @@ ifeq ($(TARGET_PLATFORM),PLATFORM_DESKTOP_GLFW)
         #LDLIBS += -latomic
     endif
     ifeq ($(PLATFORM_OS),OSX)
-        LDLIBS = -framework OpenGL -framework Cocoa -framework IOKit -framework CoreAudio -framework CoreVideo
+        ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+            # NOTE: Vulkan on macOS goes through MoltenVK. VULKAN_SDK env var
+            # is set by the LunarG installer.
+            LDLIBS = -lvulkan -framework Cocoa -framework IOKit -framework CoreAudio -framework CoreVideo
+            LDFLAGS += -Wl,-rpath,$(VULKAN_SDK)/lib
+        else
+            LDLIBS = -framework OpenGL -framework Cocoa -framework IOKit -framework CoreAudio -framework CoreVideo
+        endif
     endif
     ifeq ($(PLATFORM_OS),BSD)
-        LDLIBS = -lGL -lpthread
+        ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+            LDLIBS = -lvulkan -lpthread
+        else
+            LDLIBS = -lGL -lpthread
+        endif
     endif
     ifeq ($(USE_EXTERNAL_GLFW),TRUE)
         # Check the version name. If GLFW3 was built manually, it may have produced
