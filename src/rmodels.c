@@ -3,18 +3,19 @@
 *   rmodels - Basic functions to draw 3d shapes and load and draw 3d models
 *
 *   CONFIGURATION:
-*       #define SUPPORT_MODULE_RMODELS
+*       #define SUPPORT_MODULE_RMODELS      1
 *           rmodels module is included in the build
 *
-*       #define SUPPORT_FILEFORMAT_OBJ
-*       #define SUPPORT_FILEFORMAT_MTL
-*       #define SUPPORT_FILEFORMAT_IQM
-*       #define SUPPORT_FILEFORMAT_GLTF
-*       #define SUPPORT_FILEFORMAT_VOX
-*       #define SUPPORT_FILEFORMAT_M3D
+*       #define SUPPORT_FILEFORMAT_OBJ      1
+*       #define SUPPORT_FILEFORMAT_MTL      1
+*       #define SUPPORT_FILEFORMAT_IQM      1
+*       #define SUPPORT_FILEFORMAT_GLTF     1
+*       #define SUPPORT_FILEFORMAT_GLTF_WRITE   0
+*       #define SUPPORT_FILEFORMAT_VOX      1
+*       #define SUPPORT_FILEFORMAT_M3D      1
 *           Selected desired fileformats to be supported for model data loading
 *
-*       #define SUPPORT_MESH_GENERATION
+*       #define SUPPORT_MESH_GENERATION     1
 *           Support procedural mesh generation functions, uses external par_shapes.h library
 *           NOTE: Some generated meshes DO NOT include generated texture coordinates
 *
@@ -70,6 +71,11 @@
 
     #define CGLTF_IMPLEMENTATION
     #include "external/cgltf.h"         // glTF file format loading
+#endif
+#if SUPPORT_FILEFORMAT_GLTF_WRITE
+    // NOTE: No need for custom allocators, memory buffer provided
+    #define CGLTF_WRITE_IMPLEMENTATION
+    #include "external/cgltf_write.h"   // glTF file format writing
 #endif
 
 #if SUPPORT_FILEFORMAT_VOX
@@ -1949,7 +1955,7 @@ void UnloadMesh(Mesh mesh)
 // Export mesh data to file
 bool ExportMesh(Mesh mesh, const char *fileName)
 {
-    bool success = false;
+    bool result = false;
 
     if (IsFileExtension(fileName, ".obj"))
     {
@@ -2013,22 +2019,35 @@ bool ExportMesh(Mesh mesh, const char *fileName)
         }
 
         // NOTE: Text data length exported is determined by '\0' (NULL) character
-        success = SaveFileText(fileName, txtData);
+        result = SaveFileText(fileName, txtData);
 
         RL_FREE(txtData);
+    }
+    else if (IsFileExtension(fileName, ".gltf")) // Or .glb
+    {
+        // TODO: Implement gltf/glb support
+        /*
+        cgltf_size expected = cgltf_write(options, NULL, 0, data);
+        char *buffer = (char *)RL_CALLOC(expected, 0);
+        cgltf_size actual = cgltf_write(options, buffer, expected, data);
+
+        // NOTE: cgltf_write() includes a NULL terminator that should be ommited in case of a .glb
+        if (options->type == cgltf_file_type_glb) cgltf_write_glb(file, buffer, actual - 1, data->bin, data->bin_size);
+        else SaveFileText(fileName, buffer); // Write a plain JSON file
+        */
     }
     else if (IsFileExtension(fileName, ".raw"))
     {
         // TODO: Support additional file formats to export mesh vertex data
     }
 
-    return success;
+    return result;
 }
 
 // Export mesh as code file (.h) defining multiple arrays of vertex attributes
 bool ExportMeshAsCode(Mesh mesh, const char *fileName)
 {
-    bool success = false;
+    bool result = false;
 
 #ifndef TEXT_BYTES_PER_LINE
     #define TEXT_BYTES_PER_LINE     20
@@ -2112,14 +2131,14 @@ bool ExportMeshAsCode(Mesh mesh, const char *fileName)
     //-----------------------------------------------------------------------------------------
 
     // NOTE: Text data size exported is determined by '\0' (NULL) character
-    success = SaveFileText(fileName, txtData);
+    result = SaveFileText(fileName, txtData);
 
     RL_FREE(txtData);
 
-    //if (success != 0) TRACELOG(LOG_INFO, "FILEIO: [%s] Image as code exported successfully", fileName);
+    //if (result != 0) TRACELOG(LOG_INFO, "FILEIO: [%s] Image as code exported successfully", fileName);
     //else TRACELOG(LOG_WARNING, "FILEIO: [%s] Failed to export image as code", fileName);
 
-    return success;
+    return result;
 }
 
 #if SUPPORT_FILEFORMAT_OBJ || SUPPORT_FILEFORMAT_MTL
@@ -4086,7 +4105,7 @@ bool CheckCollisionSpheres(Vector3 center1, float radius1, Vector3 center2, floa
 
     // Check for distances squared to avoid sqrtf()
     float radSum = radius1 + radius2;
-    if (Vector3DistanceSqr(center1, center2) <= radSum*radSum) collision = true;
+    if (Vector3DistanceSqr(center1, center2) <= (radSum*radSum)) collision = true;
 
     return collision;
 }
@@ -4112,18 +4131,13 @@ bool CheckCollisionBoxSphere(BoundingBox box, Vector3 center, float radius)
 {
     bool collision = false;
 
-    float dmin = 0;
+    Vector3 closestPoint = {
+        Clamp(center.x, box.min.x, box.max.x),
+        Clamp(center.y, box.min.y, box.max.y),
+        Clamp(center.z, box.min.z, box.max.z)
+    };
 
-    if (center.x < box.min.x) dmin += powf(center.x - box.min.x, 2);
-    else if (center.x > box.max.x) dmin += powf(center.x - box.max.x, 2);
-
-    if (center.y < box.min.y) dmin += powf(center.y - box.min.y, 2);
-    else if (center.y > box.max.y) dmin += powf(center.y - box.max.y, 2);
-
-    if (center.z < box.min.z) dmin += powf(center.z - box.min.z, 2);
-    else if (center.z > box.max.z) dmin += powf(center.z - box.max.z, 2);
-
-    if (dmin <= (radius*radius)) collision = true;
+    if (Vector3DistanceSqr(center, closestPoint) <= (radius*radius)) collision = true;
 
     return collision;
 }
@@ -5265,7 +5279,7 @@ static cgltf_result LoadFileGLTFCallback(const struct cgltf_memory_options *memo
 }
 
 // Release file data callback for cgltf
-static void ReleaseFileGLTFCallback(const struct cgltf_memory_options *memoryOptions, const struct cgltf_file_options *fileOptions, void *data)
+static void ReleaseFileGLTFCallback(const struct cgltf_memory_options *memoryOptions, const struct cgltf_file_options *fileOptions, void *data, cgltf_size size)
 {
     UnloadFileData((unsigned char *)data);
 }
@@ -6879,7 +6893,7 @@ static Model LoadM3D(const char *fileName)
                 mi = m3d->face[i].materialid;
 
                 // Only allocate colors VertexBuffer if there's a color vertex in the model for this material batch
-                // if all colors are fully transparent black for all verteces of this materal, then assuming no vertex colors
+                // if all colors are fully transparent black for all vertices of this material, then assuming no vertex colors
                 for (j = i, l = vcolor = 0; (j < (int)m3d->numface) && (mi == m3d->face[j].materialid); j++, l++)
                 {
                     if (!m3d->vertex[m3d->face[j].vertex[0]].color ||

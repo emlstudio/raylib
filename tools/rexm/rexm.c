@@ -68,6 +68,7 @@
 #define REXM_MAX_BUFFER_SIZE            (2*1024*1024)      // 2MB
 
 #define REXM_MAX_RESOURCE_PATHS         256
+#define REXM_MAX_RESOURCE_PATH_LENGTH   256
 
 // Create local commit with changes on example renaming
 //#define RENAME_AUTO_COMMIT_CREATION
@@ -473,8 +474,8 @@ int main(int argc, char *argv[])
             exTextUpdated[1] = TextReplaceAlloc(exTextUpdated[0], "<name>", exName + strlen(exCategory) + 1);
             //TextReplaceAlloc(newExample, "<user_name>", "Ray");
             //TextReplaceAlloc(newExample, "@<user_github>", "@raysan5");
-            //TextReplaceAlloc(newExample, "<year_created>", 2025);
-            //TextReplaceAlloc(newExample, "<year_updated>", 2025);
+            //TextReplaceAlloc(newExample, "<year_created>", 2026);
+            //TextReplaceAlloc(newExample, "<year_updated>", 2026);
 
             SaveFileText(TextFormat("%s/%s/%s.c", exBasePath, exCategory, exName), exTextUpdated[1]);
             for (int i = 0; i < 6; i++) { MemFree(exTextUpdated[i]); exTextUpdated[i] = NULL; }
@@ -1267,8 +1268,7 @@ int main(int argc, char *argv[])
 
                         // NOTE: Some examples should be excluded from VS2022 solution because
                         // they have specific platform/linkage requirements:
-                        if ((strcmp(exInfo->name, "web_basic_window") == 0) ||
-                            (strcmp(exInfo->name, "raylib_opengl_interop") == 0)) continue;
+                        if (strcmp(exInfo->name, "raylib_opengl_interop") == 0) continue;
 
                         // Review: Add: raylib/projects/VS2022/examples/<category>_example_name.vcxproj
                         // Review: Add: raylib/projects/VS2022/raylib.sln
@@ -1572,13 +1572,13 @@ int main(int argc, char *argv[])
                     "    SaveFileText(\"outputLogFileName\", logText);\n"
                     "    emscripten_run_script(\"saveFileFromMEMFSToDisk('outputLogFileName','outputLogFileName')\");\n\n"
                     "    return 0";
-                char *returnReplaceTextUpdated = TextReplacEx(returnReplaceText, "outputLogFileName", TextFormat("%s.log", exName));
+                char *returnReplaceTextUpdated = TextReplaceAlloc(returnReplaceText, "outputLogFileName", TextFormat("%s.log", exName));
 
                 char *srcTextUpdated[4] = { 0 };
-                srcTextUpdated[0] = TextReplacEx(srcText, "int main(void)\n{", mainReplaceText);
-                srcTextUpdated[1] = TextReplacEx(srcTextUpdated[0], "WindowShouldClose()", "WindowShouldClose() && (testFramesCount < requestedTestFrames)");
-                srcTextUpdated[2] = TextReplacEx(srcTextUpdated[1], "EndDrawing();", "EndDrawing(); testFramesCount++;");
-                srcTextUpdated[3] = TextReplacEx(srcTextUpdated[2], "    return 0", returnReplaceTextUpdated);
+                srcTextUpdated[0] = TextReplaceAlloc(srcText, "int main(void)\n{", mainReplaceText);
+                srcTextUpdated[1] = TextReplaceAlloc(srcTextUpdated[0], "WindowShouldClose()", "WindowShouldClose() && (testFramesCount < requestedTestFrames)");
+                srcTextUpdated[2] = TextReplaceAlloc(srcTextUpdated[1], "EndDrawing();", "EndDrawing(); testFramesCount++;");
+                srcTextUpdated[3] = TextReplaceAlloc(srcTextUpdated[2], "    return 0", returnReplaceTextUpdated);
                 MemFree(returnReplaceTextUpdated);
                 UnloadFileText(srcText);
 
@@ -1628,9 +1628,9 @@ int main(int argc, char *argv[])
                     "    if ((argc > 1) && (argc == 3) && (strcmp(argv[1], \"--frames\") != 0)) requestedTestFrames = atoi(argv[2]);\n";
 
                 char *srcTextUpdated[3] = { 0 };
-                srcTextUpdated[0] = TextReplacEx(srcText, "int main(void)\n{", mainReplaceText);
-                srcTextUpdated[1] = TextReplacEx(srcTextUpdated[0], "WindowShouldClose()", "WindowShouldClose() && (testFramesCount < requestedTestFrames)");
-                srcTextUpdated[2] = TextReplacEx(srcTextUpdated[1], "EndDrawing();", "EndDrawing(); testFramesCount++;");
+                srcTextUpdated[0] = TextReplaceAlloc(srcText, "int main(void)\n{", mainReplaceText);
+                srcTextUpdated[1] = TextReplaceAlloc(srcTextUpdated[0], "WindowShouldClose()", "WindowShouldClose() && (testFramesCount < requestedTestFrames)");
+                srcTextUpdated[2] = TextReplaceAlloc(srcTextUpdated[1], "EndDrawing();", "EndDrawing(); testFramesCount++;");
                 UnloadFileText(srcText);
 
                 SaveFileText(TextFormat("%s/%s/%s.c", exBasePath, exCategory, exName), srcTextUpdated[2]);
@@ -1874,7 +1874,7 @@ int main(int argc, char *argv[])
             printf("\n////////////////////////////////////////////////////////////////////////////////////////////\n");
             printf("//                                                                                        //\n");
             printf("// rexm [raylib examples manager] - A simple command-line tool to manage raylib examples  //\n");
-            printf("// powered by raylib v5.6-dev                                                             //\n");
+            printf("// powered by raylib v6.0                                                                 //\n");
             printf("//                                                                                        //\n");
             printf("// Copyright (c) 2025-2026 Ramon Santamaria (@raysan5)                                    //\n");
             printf("//                                                                                        //\n");
@@ -2037,8 +2037,10 @@ static int UpdateRequiredFiles(void)
                     // In this case, we focus on web building for: glsl100
                     if (TextFindIndex(resPaths[r], "glsl%i") > -1)
                     {
+                        char *resPathUpdated = TextReplaceAlloc(resPaths[r], "glsl%i", "glsl100");
                         memset(resPaths[r], 0, 256);
-                        strcpy(resPaths[r], TextReplace(resPaths[r], "glsl%i", "glsl100"));
+                        strcpy(resPaths[r], resPathUpdated);
+                        RL_FREE(resPathUpdated);
                     }
 
                     if (r < (resPathCount - 1))
@@ -2140,7 +2142,7 @@ static int UpdateRequiredFiles(void)
         {
             mdIndex += sprintf(mdTextUpdated + mdListStartIndex + mdIndex, TextFormat("\n### category: shaders [%i]\n\n", exCollectionCount));
             mdIndex += sprintf(mdTextUpdated + mdListStartIndex + mdIndex,
-                "Examples using raylib shaders functionality, including shaders loading, parameters configuration and drawing using them (model shaders and postprocessing shaders). This functionality is directly provided by raylib [rlgl](../src/rlgl.c) module.\n\n");
+                "Examples using raylib shaders functionality, including shaders loading, parameters configuration and drawing using them (model shaders and postprocessing shaders). This functionality is directly provided by raylib [rlgl](../src/rlgl.h) module.\n\n");
         }
         else if (i == 6)    // "audio"
         {
@@ -2491,25 +2493,21 @@ static void SortExampleByName(rlExampleInfo *items, int count)
     qsort(items, count, sizeof(rlExampleInfo), rlExampleInfoCompare);
 }
 
-// Scan resource paths in example file
-// WARNING: Supported resource file extensions is hardcoded by used file types
-// but new examples could require other file extensions to be added,
-// maybe it should look for '.xxx")' patterns instead
-// TODO: WARNING: Some resources could require linked resources: .fnt --> .png, .mtl --> .png, .gltf --> .png, ...
-static char **LoadExampleResourcePaths(const char *filePath, int *resPathCount)
+// Scan asset paths from a source code file (raylib)
+// WARNING: Supported asset file extensions are hardcoded by used file types
+// but new examples could require other file extensions to be added
+static char **LoadExampleResourcePaths(const char *srcFilePath, int *resPathCount)
 {
-    #define REXM_MAX_RESOURCE_PATH_LEN    256
-
     char **paths = (char **)RL_CALLOC(REXM_MAX_RESOURCE_PATHS, sizeof(char **));
-    for (int i = 0; i < REXM_MAX_RESOURCE_PATHS; i++) paths[i] = (char *)RL_CALLOC(REXM_MAX_RESOURCE_PATH_LEN, sizeof(char));
+    for (int i = 0; i < REXM_MAX_RESOURCE_PATHS; i++) paths[i] = (char *)RL_CALLOC(REXM_MAX_RESOURCE_PATH_LENGTH, sizeof(char));
 
     int resCounter = 0;
-    char *code = LoadFileText(filePath);
+    char *code = LoadFileText(srcFilePath);
 
     if (code != NULL)
     {
         // Resources extensions to check
-        const char *exts[] = { ".png", ".bmp", ".jpg", ".qoi", ".gif", ".raw", ".hdr", ".ttf", ".fnt", ".wav", ".ogg", ".mp3", ".flac", ".mod", ".qoa", ".obj", ".iqm", ".glb", ".m3d", ".vox", ".vs", ".fs", ".txt" };
+        const char *exts[] = { ".png", ".bmp", ".jpg", ".qoi", ".gif", ".raw", ".hdr", ".ttf", ".fnt", ".wav", ".ogg", ".mp3", ".flac", ".mod", ".xm", ".qoa", ".obj", ".iqm", ".glb", ".m3d", ".vox", ".vs", ".fs", ".txt" };
         const int extCount = sizeof(exts)/sizeof(char *);
 
         char *ptr = code;
@@ -2535,9 +2533,9 @@ static char **LoadExampleResourcePaths(const char *filePath, int *resPathCount)
                 !((functionIndex05 != -1) && (functionIndex05 < 40)))    // Not found SaveFileText() before ""
             {
                 int len = (int)(end - start);
-                if ((len > 0) && (len < REXM_MAX_RESOURCE_PATH_LEN))
+                if ((len > 0) && (len < REXM_MAX_RESOURCE_PATH_LENGTH))
                 {
-                    char buffer[REXM_MAX_RESOURCE_PATH_LEN] = { 0 };
+                    char buffer[REXM_MAX_RESOURCE_PATH_LENGTH] = { 0 };
                     strncpy(buffer, start, len);
                     buffer[len] = '\0';
 
@@ -2572,6 +2570,29 @@ static char **LoadExampleResourcePaths(const char *filePath, int *resPathCount)
 
         UnloadFileText(code);
     }
+
+    /*
+    // WARNING: Some resources could require linked resources: .fnt --> .png, .mtl --> .png, .gltf --> .png
+    // So doing a recursive pass to scan possible files with second resources
+    int currentAssetCounter = resCounter;
+    for (int i = 0; i < currentAssetCounter; i++)
+    {
+        if (IsFileExtension(paths[i], ".fnt;.gltf"))
+        {
+            int assetCount2 = 0;
+            // ERROR: srcFilePath changes on rcursive call and TextFormat() static arrays are override
+            char **assetPaths2 = LoadExampleResourcePaths(TextFormat("%s/%s", GetDirectoryPath(srcFilePath), paths[i]), &assetCount2);
+
+            for (int j = 0; j < assetCount2; j++)
+            {
+                strcpy(paths[resCounter], TextFormat("%s/%s", GetDirectoryPath(paths[i]) + 2, assetPaths2[j]));
+                resCounter++;
+            }
+
+            UnloadExampleResourcePaths(assetPaths2);
+        }
+    }
+    */
 
     *resPathCount = resCounter;
     return paths;
@@ -2903,14 +2924,14 @@ static void UpdateWebMetadata(const char *exHtmlPath, const char *exFilePath)
         UnloadFileText(exText);
 
         // Update example.html required text
-        exHtmlTextUpdated[0] = TextReplace(exHtmlText, "raylib web game", exTitle);
-        exHtmlTextUpdated[1] = TextReplace(exHtmlTextUpdated[0], "New raylib web videogame, developed using raylib videogames library", exDescription);
-        exHtmlTextUpdated[2] = TextReplace(exHtmlTextUpdated[1], "https://www.raylib.com/common/raylib_logo.png",
+        exHtmlTextUpdated[0] = TextReplaceAlloc(exHtmlText, "raylib web game", exTitle);
+        exHtmlTextUpdated[1] = TextReplaceAlloc(exHtmlTextUpdated[0], "New raylib web videogame, developed using raylib videogames library", exDescription);
+        exHtmlTextUpdated[2] = TextReplaceAlloc(exHtmlTextUpdated[1], "https://www.raylib.com/common/raylib_logo.png",
             TextFormat("https://raw.githubusercontent.com/raysan5/raylib/master/examples/%s/%s.png", exCategory, exName));
-        exHtmlTextUpdated[3] = TextReplace(exHtmlTextUpdated[2], "https://www.raylib.com/games.html",
+        exHtmlTextUpdated[3] = TextReplaceAlloc(exHtmlTextUpdated[2], "https://www.raylib.com/games.html",
             TextFormat("https://www.raylib.com/examples/%s/%s.html", exCategory, exName));
-        exHtmlTextUpdated[4] = TextReplace(exHtmlTextUpdated[3], "raylib - example", TextFormat("raylib - %s", exName)); // og:site_name
-        exHtmlTextUpdated[5] = TextReplace(exHtmlTextUpdated[4], "https://github.com/raysan5/raylib",
+        exHtmlTextUpdated[4] = TextReplaceAlloc(exHtmlTextUpdated[3], "raylib - example", TextFormat("raylib - %s", exName)); // og:site_name
+        exHtmlTextUpdated[5] = TextReplaceAlloc(exHtmlTextUpdated[4], "https://github.com/raysan5/raylib",
             TextFormat("https://github.com/raysan5/raylib/blob/master/examples/%s/%s.c", exCategory, exName));
 
         SaveFileText(exHtmlPathCopy, exHtmlTextUpdated[5]);

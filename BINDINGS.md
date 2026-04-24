@@ -6,7 +6,7 @@ Some people ported raylib to other languages in the form of bindings or wrappers
 
 | Name                                                                                     | raylib Version   | Language                                                             | License              |
 | :--------------------------------------------------------------------------------------- | :--------------: | :------------------------------------------------------------------: | :------------------: |
-| [raylib](https://github.com/raysan5/raylib)                                              | **5.5**          | [C/C++](https://en.wikipedia.org/wiki/C_(programming_language))      | Zlib                 |
+| [raylib](https://github.com/raysan5/raylib)                                              | **6.0**          | [C/C++](https://en.wikipedia.org/wiki/C_(programming_language))      | Zlib                 |
 | [raylib-ada](https://github.com/Fabien-Chouteau/raylib-ada)                                              | **5.5**          | [Ada](https://en.wikipedia.org/wiki/Ada_(programming_language))      | MIT                 |
 | [raylib-beef](https://github.com/Starpelly/raylib-beef)                                  | **5.5**          | [Beef](https://www.beeflang.org)                                     | MIT                  |
 | [raybit](https://github.com/Alex-Velez/raybit)                                           | **5.0**          | [Brainfuck](https://en.wikipedia.org/wiki/Brainfuck)                 | MIT                  |
@@ -33,6 +33,7 @@ Some people ported raylib to other languages in the form of bindings or wrappers
 | [rayex](https://github.com/shiryel/rayex)                                                | 3.7              | [elixir](https://elixir-lang.org)                                    | Apache-2.0           |
 | [raylib-elle](https://github.com/acquitelol/elle/blob/rewrite/std/raylib.le)             | **5.5**          | [Elle](https://github.com/acquitelol/elle)                           | GPL-3.0              |
 | [raylib-factor](https://github.com/factor/factor/blob/master/extra/raylib/raylib.factor) | 5.5              | [Factor](https://factorcode.org)                                     | BSD                  |
+| [raylib4fb](https://github.com/mudhairless/raylib4fb)                                    | **5.5**          | [FreeBASIC](https://www.freebasic.net)                               | Zlib                 |
 | [raylib-freebasic](https://github.com/WIITD/raylib-freebasic)                            | **5.0**          | [FreeBASIC](https://www.freebasic.net)                               | MIT                  |
 | [raylib.f](https://github.com/cthulhuology/raylib.f)                                     | **5.5**          | [Forth](https://forth.com)                                           | Zlib                 |
 | [fortran-raylib](https://github.com/interkosmos/fortran-raylib)                          | **5.5**          | [Fortran](https://fortran-lang.org)                                  | ISC                  |
@@ -63,7 +64,7 @@ Some people ported raylib to other languages in the form of bindings or wrappers
 | [raylib_odin_bindings](https://github.com/Deathbat2190/raylib_odin_bindings)             | 4.0-dev          | [Odin](https://odin-lang.org)                                        | MIT                  |
 | [raylib-ocaml](https://github.com/tjammer/raylib-ocaml)                                  | **5.0**          | [OCaml](https://ocaml.org)                                           | MIT                  |
 | [TurboRaylib](https://github.com/turborium/TurboRaylib)                                  | 4.5              | [Object Pascal](https://en.wikipedia.org/wiki/Object_Pascal)         | MIT                  |
-| [Ray4Laz](https://github.com/GuvaCode/Ray4Laz)                                           | **5.5**          | [Free Pascal](https://en.wikipedia.org/wiki/Free_Pascal)/[Delphi](https://en.wikipedia.org/wiki/Delphi_(software))             | Zlib                 |
+| [Ray4Laz](https://github.com/GuvaCode/Ray4Laz)                                           | **6.0**          | [Free Pascal](https://en.wikipedia.org/wiki/Free_Pascal)/[Delphi](https://en.wikipedia.org/wiki/Delphi_(software))             | Zlib                 |
 | [Raylib.4.0.Pascal](https://github.com/sysrpl/Raylib.4.0.Pascal)                         | 4.0              | [Free Pascal](https://en.wikipedia.org/wiki/Free_Pascal)             | Zlib                 |
 | [pyraylib](https://github.com/Ho011/pyraylib)                                            | 3.7              | [Python](https://www.python.org)                                     | Zlib                 |
 | [raylib-python-cffi](https://github.com/electronstudio/raylib-python-cffi)               | **5.5**              | [Python](https://www.python.org)                                     | EPL-2.0              |
@@ -111,7 +112,7 @@ Some people ported raylib to other languages in the form of bindings or wrappers
 These are utility wrappers for specific languages, they are not required to use raylib in the language but may adapt the raylib API to be more inline with the language's paradigm.
 | Name                                                 | raylib Version | Language                                     | License |
 | ---------------------------------------------------- | :------------: | :------------------------------------------: | :-----: |
-| [raylib-cpp](https://github.com/robloach/raylib-cpp) | **5.5**        | [C++](https://en.wikipedia.org/wiki/C%2B%2B) | Zlib    |
+| [raylib-cpp](https://github.com/robloach/raylib-cpp) | **6.0**        | [C++](https://en.wikipedia.org/wiki/C%2B%2B) | Zlib    |
 | [claylib](https://github.com/defun-games/claylib)    | 4.5            | [Common Lisp](https://common-lisp.net)       | Zlib    |
 | [rayed-bqn](https://github.com/Brian-ED/rayed-bqn)   | **5.0**        | [BQN](https://mlochbaum.github.io/BQN)       | MIT     |
 | [DOOR](https://github.com/RealDoigt/DOOR)            | 4.0            | [D](https://dlang.org)                       | MIT     |
