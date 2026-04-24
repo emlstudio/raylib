@@ -1533,8 +1533,17 @@ void rlvkSetWindow(void *glfwWindow)
     uint32_t enabledLayerCount = 0;
 #endif
 
+#if defined(__APPLE__)
+    // MoltenVK requires portability enumeration
+    extensions[extCount++] = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+    extensions[extCount++] = "VK_KHR_get_physical_device_properties2";
+#endif
+
     VkInstanceCreateInfo instanceInfo = {
         .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+#if defined(__APPLE__)
+        .flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR,
+#endif
         .pApplicationInfo = &appInfo,
         .enabledExtensionCount = extCount,
         .ppEnabledExtensionNames = extensions,
@@ -1629,15 +1638,31 @@ void rlvkSetWindow(void *glfwWindow)
     }
 
     VkPhysicalDeviceFeatures features = { 0 };
-    const char *devExts[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+
+    // Probe for VK_KHR_portability_subset (required on MoltenVK, absent on Linux/Windows)
+    uint32_t devExtCount = 0;
+    vkEnumerateDeviceExtensionProperties(RLVK.physicalDevice, NULL, &devExtCount, NULL);
+    VkExtensionProperties *devExtProps = RL_CALLOC(devExtCount, sizeof(VkExtensionProperties));
+    vkEnumerateDeviceExtensionProperties(RLVK.physicalDevice, NULL, &devExtCount, devExtProps);
+
+    const char *deviceExtensions[4];
+    uint32_t deviceExtCount = 0;
+    deviceExtensions[deviceExtCount++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    for (uint32_t i = 0; i < devExtCount; i++) {
+        if (strcmp(devExtProps[i].extensionName, "VK_KHR_portability_subset") == 0) {
+            deviceExtensions[deviceExtCount++] = "VK_KHR_portability_subset";
+            break;
+        }
+    }
+    RL_FREE(devExtProps);
 
     VkDeviceCreateInfo deviceInfo = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = uniqueCount,
         .pQueueCreateInfos = queueInfos,
         .pEnabledFeatures = &features,
-        .enabledExtensionCount = 1,
-        .ppEnabledExtensionNames = devExts,
+        .enabledExtensionCount = deviceExtCount,
+        .ppEnabledExtensionNames = deviceExtensions,
     };
 
     result = vkCreateDevice(RLVK.physicalDevice, &deviceInfo, NULL, &RLVK.device);
