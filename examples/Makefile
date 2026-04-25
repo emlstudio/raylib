@@ -299,6 +299,10 @@ LDFLAGS = -L. -L$(RAYLIB_RELEASE_PATH)
 
 # Vulkan SDK paths (LunarG SDK on Windows / macOS, distro packages on Linux / BSD)
 ifeq ($(GRAPHICS),GRAPHICS_API_VULKAN)
+    # Surface GRAPHICS_API_VULKAN to example translation units so they can
+    # gate Vulkan-specific code (e.g. shader-blob loading) with
+    # #if defined(GRAPHICS_API_VULKAN).
+    CFLAGS += -DGRAPHICS_API_VULKAN
     ifneq ($(VULKAN_SDK),)
         CFLAGS  += -I$(VULKAN_SDK)/include
         LDFLAGS += -L$(VULKAN_SDK)/lib

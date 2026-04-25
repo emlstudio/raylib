@@ -23,6 +23,11 @@
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"                 // Required for GUI controls
 
+#if defined(GRAPHICS_API_VULKAN)
+    #include "resources/shaders/vulkan/color_correction.rlvk.h"
+    extern int *GetShaderLocsAuto(unsigned int shaderId);
+#endif
+
 #if defined(PLATFORM_DESKTOP)
     #define GLSL_VERSION            330
 #else   // PLATFORM_ANDROID, PLATFORM_WEB
@@ -50,7 +55,13 @@ int main(void)
         LoadTexture("resources/fudesumi.png")
     };
 
+#if defined(GRAPHICS_API_VULKAN)
+    Shader shdrColorCorrection = { 0 };
+    shdrColorCorrection.id   = LoadColor_correctionShader();
+    shdrColorCorrection.locs = GetShaderLocsAuto(shdrColorCorrection.id);
+#else
     Shader shdrColorCorrection = LoadShader(0, TextFormat("resources/shaders/glsl%i/color_correction.fs", GLSL_VERSION));
+#endif
 
     int imageIndex = 0;
     int resetButtonClicked = 0;

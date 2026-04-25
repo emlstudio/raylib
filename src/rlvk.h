@@ -849,6 +849,13 @@ typedef struct rlvkContext {
     VkPipelineCache pipelineCache;
     VkDescriptorSetLayout descriptorSetLayout;
 
+    // Per-frame transient pool for sampler descriptor sets allocated mid-
+    // frame (one per draw call that switches texture under a custom shader).
+    // Reset at frame begin once vkWaitForFences confirms the previous use is
+    // complete. Avoids vkUpdateDescriptorSets mid-cmd-buffer (which Vulkan
+    // disallows without UPDATE_AFTER_BIND).
+    VkDescriptorPool perFrameSamplerPool[RLVK_MAX_FRAMES_IN_FLIGHT];
+
     // Default texture
     VkImage defaultTexImage;
     VkDeviceMemory defaultTexMemory;
@@ -966,6 +973,13 @@ typedef struct rlvkState {
 
     // Active framebuffer
     unsigned int activeFramebuffer;
+
+    // Per-frame vertex-buffer append offset (in vertex units, not bytes).
+    // Multiple flushes within one frame (e.g. via BeginShaderMode) all share
+    // the same vertex buffer in GPU memory. Without an offset they'd
+    // overwrite each other and earlier flushes would read the latest data
+    // when the GPU executes the command buffer. Reset to 0 at frame begin.
+    int frameVertexBase;
 
     rlvkShader shaders[RLVK_MAX_SHADERS];
 
@@ -1691,6 +1705,20 @@ static void rlvkCreateDescriptors(void)
     };
     vkCreateDescriptorPool(RLVK.device, &poolInfo, NULL, &RLVK.descriptorPool);
 
+    // Per-frame transient pool used by the draw-loop's per-draw sampler
+    // descriptor allocator. Sized for up to 1024 unique texture binds per
+    // frame; reset whole-pool at frame begin once the previous use is fenced.
+    VkDescriptorPoolSize transientSize = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024 };
+    VkDescriptorPoolCreateInfo transientInfo = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .flags = 0,                       // bulk reset only — no FREE_DESCRIPTOR_SET
+        .maxSets = 1024,
+        .poolSizeCount = 1, .pPoolSizes = &transientSize,
+    };
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
+        vkCreateDescriptorPool(RLVK.device, &transientInfo, NULL, &RLVK.perFrameSamplerPool[f]);
+    }
+
     // Allocate default texture descriptor set
     VkDescriptorSetAllocateInfo dsAlloc = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2326,6 +2354,14 @@ void rlvkBeginFrame(void)
 {
     vkWaitForFences(RLVK.device, 1, &RLVK.inFlightFences[RLVK.currentFrame], VK_TRUE, UINT64_MAX);
 
+    // Recycle the previous frame's transient sampler descriptor allocations.
+    // Safe now that the fence above guarantees the GPU is done with them.
+    if (RLVK.perFrameSamplerPool[RLVK.currentFrame] != VK_NULL_HANDLE) {
+        vkResetDescriptorPool(RLVK.device, RLVK.perFrameSamplerPool[RLVK.currentFrame], 0);
+    }
+    // Append-write vertex data starts fresh at offset 0 each frame.
+    RLVK_STATE.frameVertexBase = 0;
+
     VkResult result = vkAcquireNextImageKHR(RLVK.device, RLVK.swapchain, UINT64_MAX,
         RLVK.imageAvailableSemaphores[RLVK.currentFrame], VK_NULL_HANDLE, &RLVK.imageIndex);
 
@@ -2587,6 +2623,10 @@ RLAPI void rlglClose(void)
 
     // Destroy descriptors
     vkDestroyDescriptorPool(RLVK.device, RLVK.descriptorPool, NULL);
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
+        if (RLVK.perFrameSamplerPool[f] != VK_NULL_HANDLE)
+            vkDestroyDescriptorPool(RLVK.device, RLVK.perFrameSamplerPool[f], NULL);
+    }
     vkDestroyDescriptorSetLayout(RLVK.device, RLVK.descriptorSetLayout, NULL);
 
     // Destroy default texture
@@ -2863,14 +2903,23 @@ RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
         VkCommandBuffer cmd = RLVK.commandBuffers[RLVK.currentFrame];
         int frame = (int)RLVK.currentFrame;
 
-        // Upload vertex data to Vulkan buffers
+        // Upload vertex data to Vulkan buffers — APPEND at the per-frame
+        // base offset so multiple flushes within a single frame don't
+        // clobber each other. Without this, an earlier flush's draws would
+        // read the latest data once the GPU executes the cmd buffer (e.g.
+        // BeginShaderMode triggers a flush, then later UI flushes overwrite).
         rlVertexBuffer *vb = &batch->vertexBuffer[batch->currentBuffer];
         int vertexCount = RLVK_STATE.vertexCounter;
+        int baseVertex  = RLVK_STATE.frameVertexBase;
 
-        memcpy(RLVK.vertexMapped[frame][0], vb->vertices, vertexCount * 3 * sizeof(float));
-        memcpy(RLVK.vertexMapped[frame][1], vb->texcoords, vertexCount * 2 * sizeof(float));
-        memcpy(RLVK.vertexMapped[frame][2], vb->normals, vertexCount * 3 * sizeof(float));
-        memcpy(RLVK.vertexMapped[frame][3], vb->colors, vertexCount * 4 * sizeof(unsigned char));
+        memcpy((char*)RLVK.vertexMapped[frame][0] + baseVertex * 3 * sizeof(float),
+               vb->vertices, vertexCount * 3 * sizeof(float));
+        memcpy((char*)RLVK.vertexMapped[frame][1] + baseVertex * 2 * sizeof(float),
+               vb->texcoords, vertexCount * 2 * sizeof(float));
+        memcpy((char*)RLVK.vertexMapped[frame][2] + baseVertex * 3 * sizeof(float),
+               vb->normals, vertexCount * 3 * sizeof(float));
+        memcpy((char*)RLVK.vertexMapped[frame][3] + baseVertex * 4 * sizeof(unsigned char),
+               vb->colors, vertexCount * 4 * sizeof(unsigned char));
 
         // Set viewport and scissor
         VkViewport viewport = {
@@ -2890,7 +2939,14 @@ RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
             RLVK.vertexBuffers[frame][2],
             RLVK.vertexBuffers[frame][3],
         };
-        VkDeviceSize offsets[4] = { 0, 0, 0, 0 };
+        // Bind with the per-flush byte offset so the GPU reads from the
+        // region we just wrote into (not whatever a later flush overwrites).
+        VkDeviceSize offsets[4] = {
+            (VkDeviceSize)baseVertex * 3 * sizeof(float),
+            (VkDeviceSize)baseVertex * 2 * sizeof(float),
+            (VkDeviceSize)baseVertex * 3 * sizeof(float),
+            (VkDeviceSize)baseVertex * 4 * sizeof(unsigned char),
+        };
         vkCmdBindVertexBuffers(cmd, 0, 4, vkBuffers, offsets);
 
         // Compute MVP matrix: projection * modelview
@@ -2944,25 +3000,8 @@ RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
             else if (mode == RL_TRIANGLES) rs.topology = 0;
             else /* RL_QUADS */ rs.topology = 0;          // indexed TRIANGLE_LIST
 
-            // Bind the per-texture descriptor for set 0. tex->descriptorSet
-            // was allocated against RLVK.descriptorSetLayout, which is the
-            // SAME object as every shader's set_layouts[0] (see
-            // rlvkBuildDescriptorSetLayouts), so the bind is layout-compatible
-            // across all shaders.
-            //
-            // KNOWN LIMITATION: on MoltenVK, custom shaders with a multi-
-            // descriptor-set pipeline_layout do not reliably sample non-
-            // default textures via this binding (the parrot in
-            // shaders_color_correction renders white under BeginShaderMode).
-            // The default shader (1-set layout) and direct DrawTexture calls
-            // outside shader mode work correctly. Tasks 39-40 (custom-shader
-            // example migration) need per-draw scratch descriptor sets or
-            // VK_EXT_descriptor_indexing UPDATE_AFTER_BIND to fix; deferred.
             unsigned int texId = batch->draws[i].textureId;
             if (texId == 0) texId = RLVK_STATE.defaultTextureId;
-            VkDescriptorSet texSet = (texId < RLVK_MAX_TEXTURES && rlvkTextures[texId].active)
-                ? rlvkTextures[texId].descriptorSet
-                : RLVK.defaultTexDescriptor;
 
             VkPipeline p = rlvkGetPipeline(shader_id, RLVK_VLAYOUT_BATCH_2D, &rs);
             if (!p) continue;
@@ -2970,20 +3009,52 @@ RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
 
             rlvkFlushShaderForDraw(cmd, RLVK.currentFrame);
 
-            if (texId != lastBoundTex) {
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    active_shader->pipeline_layout, 0, 1, &texSet, 0, NULL);
-                lastBoundTex = texId;
+            // Per-draw fresh sampler descriptor (set 0) + shader's per-frame
+            // UBO descriptors (set 1+) bound in ONE call. Fresh allocation
+            // avoids the "update bound descriptor" issue; single-call bind
+            // avoids any chance of a disturb between separate calls on
+            // MoltenVK.
+            VkDescriptorSet allSets[RLVK_MAX_DESC_SETS]; uint32_t setCount = 0;
+            VkDescriptorSet drawSet = VK_NULL_HANDLE;
+            if (active_shader->set_layout_used[0]
+                && RLVK.perFrameSamplerPool[RLVK.currentFrame] != VK_NULL_HANDLE) {
+                VkImageView view = RLVK.defaultTexView;
+                VkSampler   smp  = RLVK.defaultSampler;
+                if (texId < RLVK_MAX_TEXTURES && rlvkTextures[texId].active) {
+                    view = rlvkTextures[texId].view;
+                    smp  = rlvkTextures[texId].sampler;
+                }
+                VkDescriptorSetAllocateInfo dsai = {
+                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                    .descriptorPool = RLVK.perFrameSamplerPool[RLVK.currentFrame],
+                    .descriptorSetCount = 1,
+                    .pSetLayouts = &active_shader->set_layouts[0],
+                };
+                if (vkAllocateDescriptorSets(RLVK.device, &dsai, &drawSet) == VK_SUCCESS) {
+                    VkDescriptorImageInfo info = {
+                        .sampler = smp, .imageView = view,
+                        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    };
+                    VkWriteDescriptorSet w = {
+                        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                        .dstSet = drawSet, .dstBinding = 0,
+                        .descriptorCount = 1,
+                        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                        .pImageInfo = &info,
+                    };
+                    vkUpdateDescriptorSets(RLVK.device, 1, &w, 0, NULL);
+                    allSets[setCount++] = drawSet;
+                }
             }
-
-            // Bind the shader's own UBO sets (set 1+) for shaders that
-            // declared per-shader UBOs. Set 0 was bound externally above.
             for (int sIdx = 1; sIdx < RLVK_MAX_DESC_SETS; sIdx++) {
                 if (!active_shader->set_layout_used[sIdx]) continue;
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    active_shader->pipeline_layout, (uint32_t)sIdx, 1,
-                    &active_shader->descriptor_sets[RLVK.currentFrame][sIdx], 0, NULL);
+                allSets[setCount++] = active_shader->descriptor_sets[RLVK.currentFrame][sIdx];
             }
+            if (setCount > 0) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    active_shader->pipeline_layout, 0, setCount, allSets, 0, NULL);
+            }
+            lastBoundTex = texId;
 
             if (mode == RL_QUADS) {
                 vkCmdBindIndexBuffer(cmd, RLVK.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
@@ -3008,6 +3079,7 @@ draw_done:;
         batch->draws[i].vertexCount = 0;
         batch->draws[i].vertexAlignment = 0;
     }
+    RLVK_STATE.frameVertexBase += RLVK_STATE.vertexCounter;
     RLVK_STATE.vertexCounter = 0;
     batch->currentDepth = 0.0f;
     batch->drawCounter = 1;
