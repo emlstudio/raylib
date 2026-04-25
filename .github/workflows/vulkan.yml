@@ -36,7 +36,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # Windows is intentionally absent — the Makefile branch for
+        # GRAPHICS=GRAPHICS_API_VULKAN on PLATFORM_OS=WINDOWS is wired
+        # (src/Makefile, src/rlvk.h Apple/non-Apple guards), but the
+        # GitHub-Actions Vulkan-SDK installers in common use
+        # (humbletim/setup-vulkan-sdk, jakoch/install-vulkan-sdk-action)
+        # all currently pull deprecated actions/cache@v2 and fail. Add
+        # Windows back once there's an updated installer action, or wire
+        # the LunarG SDK installer directly via PowerShell.
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -64,14 +72,6 @@ jobs:
           PREFIX="$(brew --prefix molten-vk)"
           echo "VULKAN_SDK=$PREFIX" >> $GITHUB_ENV
           echo "DYLD_LIBRARY_PATH=$PREFIX/lib" >> $GITHUB_ENV
-
-      - name: Install Vulkan SDK (Windows)
-        if: runner.os == 'Windows'
-        uses: humbletim/setup-vulkan-sdk@v1.2.0
-        with:
-          vulkan-query-version: 1.3.268.0
-          vulkan-components: Vulkan-Headers,Vulkan-Loader,Glslang
-          vulkan-use-cache: true
 
       # ──────────────────────────────────────────────────────────────────
       # Build: libraylib + rlvk-shdc + tool fixtures
