@@ -64,6 +64,21 @@ for case in $CASES; do
         continue
     fi
 
+    if ! command -v compare >/dev/null 2>&1; then
+        # ImageMagick not installed — fall back to a byte-exact comparison
+        # via cmp. Same-driver, same-machine captures should be byte-identical
+        # frame-to-frame, so cmp is a reasonable smoke test in the absence of
+        # tolerance-based comparison.
+        if cmp -s "$GOLDEN/$name.png" "$OUT/$name.png"; then
+            echo "PASS $name (cmp; ImageMagick not installed)"
+            PASS=$((PASS+1))
+        else
+            echo "FAIL $name (cmp byte mismatch; ImageMagick not installed)"
+            FAIL=$((FAIL+1))
+        fi
+        continue
+    fi
+
     diff_pixels=$(compare -metric AE -fuzz 2% \
         "$GOLDEN/$name.png" "$OUT/$name.png" "$OUT/$name.diff.png" 2>&1 || true)
 

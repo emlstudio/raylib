@@ -1,0 +1,5 @@
+# Frame-capture output and (driver-specific) goldens are intentionally not
+# committed — they regenerate via `sh run_visual.sh update` and differ
+# between macOS Apple-clang/MoltenVK and Linux SwiftShader rasterization.
+out/
+golden/

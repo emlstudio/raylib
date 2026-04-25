@@ -2402,6 +2402,93 @@ void rlvkBeginFrame(void)
 }
 
 // End frame — end render pass, submit command buffer, present
+// stb_image_write is built into raylib via rtextures.c (#define
+// STB_IMAGE_WRITE_IMPLEMENTATION). Declare the entry we need here so the
+// rlvk.h impl block doesn't pull in the whole stb header.
+extern int stbi_write_png(char const *filename, int w, int h, int comp,
+                          const void *data, int stride_in_bytes);
+
+// Phase 4 Task 45: read back the most-recently-acquired swapchain image
+// (RLVK.swapchainImages[RLVK.imageIndex]) into a host-visible buffer and
+// write it to disk as a PNG. Caller is responsible for ensuring the
+// rendering for this frame has been submitted; we vkDeviceWaitIdle() to
+// guarantee the GPU is done with the image before copying.
+static void rlvkCaptureFrameToPNG(const char *path)
+{
+    if (!path || !path[0]) return;
+
+    vkDeviceWaitIdle(RLVK.device);
+
+    uint32_t w = RLVK.swapchainExtent.width;
+    uint32_t h = RLVK.swapchainExtent.height;
+    VkDeviceSize byteCount = (VkDeviceSize)w * h * 4;
+
+    // Staging buffer (host-visible) sized for one RGBA8 image.
+    VkBuffer       staging      = VK_NULL_HANDLE;
+    VkDeviceMemory stagingMem   = VK_NULL_HANDLE;
+    rlvkCreateBuffer(byteCount,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+        &staging, &stagingMem);
+
+    VkImage swImg = RLVK.swapchainImages[RLVK.imageIndex];
+
+    VkCommandBuffer cmd = rlvkBeginSingleTimeCommands();
+
+    // PRESENT_SRC_KHR -> TRANSFER_SRC_OPTIMAL
+    VkImageMemoryBarrier toSrc = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = swImg,
+        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
+        .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+    };
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, NULL, 0, NULL, 1, &toSrc);
+
+    VkBufferImageCopy region = {
+        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .imageExtent = { w, h, 1 },
+    };
+    vkCmdCopyImageToBuffer(cmd, swImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        staging, 1, &region);
+
+    rlvkEndSingleTimeCommands(cmd);  // submits + waits
+
+    // Map staging, swizzle BGRA->RGBA if needed, write PNG.
+    void *mapped = NULL;
+    vkMapMemory(RLVK.device, stagingMem, 0, byteCount, 0, &mapped);
+    unsigned char *src = (unsigned char *)mapped;
+    unsigned char *rgba = (unsigned char *)RL_MALLOC(byteCount);
+    if (rgba) {
+        int bgra = (RLVK.swapchainFormat == VK_FORMAT_B8G8R8A8_UNORM
+                 || RLVK.swapchainFormat == VK_FORMAT_B8G8R8A8_SRGB);
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            unsigned char r = bgra ? src[i*4 + 2] : src[i*4 + 0];
+            unsigned char g = src[i*4 + 1];
+            unsigned char b = bgra ? src[i*4 + 0] : src[i*4 + 2];
+            unsigned char a = src[i*4 + 3];
+            rgba[i*4 + 0] = r; rgba[i*4 + 1] = g;
+            rgba[i*4 + 2] = b; rgba[i*4 + 3] = a;
+        }
+        if (!stbi_write_png(path, (int)w, (int)h, 4, rgba, (int)w * 4)) {
+            TRACELOG(RL_LOG_WARNING, "VULKAN: capture: stbi_write_png failed for %s", path);
+        } else {
+            TRACELOG(RL_LOG_INFO, "VULKAN: captured frame to %s (%ux%u)", path, w, h);
+        }
+        RL_FREE(rgba);
+    }
+    vkUnmapMemory(RLVK.device, stagingMem);
+
+    vkDestroyBuffer(RLVK.device, staging, NULL);
+    vkFreeMemory(RLVK.device, stagingMem, NULL);
+}
+
 void rlvkEndFrame(void)
 {
     if (!RLVK.frameBegun) return;
@@ -2423,6 +2510,26 @@ void rlvkEndFrame(void)
     };
 
     vkQueueSubmit(RLVK.graphicsQueue, 1, &submitInfo, RLVK.inFlightFences[RLVK.currentFrame]);
+
+    // Phase 4 Task 45: optional frame-capture hook for visual regression.
+    // RLVK_CAPTURE_FRAME=N RLVK_CAPTURE_PATH=/abs/path.png ./example
+    // captures frame N as PNG and exits. The hook waits for the just-
+    // submitted draw to finish, copies the swapchain image into a host
+    // buffer, writes PNG via stb_image_write, and exits cleanly.
+    {
+        static int captureCount  = -1;
+        static int captureTarget = -2;
+        if (captureTarget == -2) {
+            const char *env = getenv("RLVK_CAPTURE_FRAME");
+            captureTarget = (env && env[0]) ? atoi(env) : -1;
+        }
+        captureCount++;
+        if (captureTarget >= 0 && captureCount == captureTarget) {
+            const char *path = getenv("RLVK_CAPTURE_PATH");
+            if (path && path[0]) rlvkCaptureFrameToPNG(path);
+            exit(0);
+        }
+    }
 
     VkPresentInfoKHR presentInfo = {
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
