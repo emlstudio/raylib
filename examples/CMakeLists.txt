@@ -63,6 +63,16 @@ if(NOT CMAKE_USE_PTHREADS_INIT OR NOT HAVE_STDATOMIC_H)
     list(REMOVE_ITEM example_sources ${CMAKE_CURRENT_SOURCE_DIR}/core/core_loading_thread.c)
 endif ()
 
+# Examples in others/ that intentionally bypass raylib and link directly
+# against GLFW or raw OpenGL/Vulkan. They cannot build via the standard
+# raylib example pipeline (no GLFW symbols exported, no raw GL on backends
+# other than OpenGL desktop). Excluded from the CMake build for all
+# platforms — buildable manually with their own toolchain if needed.
+list(REMOVE_ITEM example_sources ${CMAKE_CURRENT_SOURCE_DIR}/others/rlgl_standalone.c)
+list(REMOVE_ITEM example_sources ${CMAKE_CURRENT_SOURCE_DIR}/others/raylib_opengl_interop.c)
+list(REMOVE_ITEM example_sources ${CMAKE_CURRENT_SOURCE_DIR}/others/vulkan_triangle.c)
+list(REMOVE_ITEM example_sources ${CMAKE_CURRENT_SOURCE_DIR}/others/vulkan_shapes_test.c)
+
 if (${PLATFORM} MATCHES "Android")
     list(REMOVE_ITEM example_sources ${CMAKE_CURRENT_SOURCE_DIR}/others/rlgl_standalone.c)
     list(REMOVE_ITEM example_sources ${CMAKE_CURRENT_SOURCE_DIR}/others/standard_lighting.c)
