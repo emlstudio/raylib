@@ -600,6 +600,9 @@ RLAPI void rlUnloadShader(unsigned int id);
 RLAPI void rlUnloadShaderProgram(unsigned int id);
 RLAPI int rlGetLocationUniform(unsigned int id, const char *uniformName);
 RLAPI int rlGetLocationAttrib(unsigned int id, const char *attribName);
+RLAPI void rlvkDeclareFrameUBO(size_t size, const rlvk_uniform_entry *uniforms);
+RLAPI void rlvkSetFrameUBO(const void *data);
+RLAPI int  rlvkGetFrameUniformLocation(const char *name);
 RLAPI void rlSetUniform(int locIndex, const void *value, int uniformType, int count);
 RLAPI void rlSetUniformMatrix(int locIndex, Matrix mat);
 RLAPI void rlSetUniformMatrices(int locIndex, const Matrix *mat, int count);
@@ -656,6 +659,11 @@ RLAPI void rlLoadDrawQuad(void);
 
 #define GLFW_INCLUDE_VULKAN
 #include "external/glfw/include/GLFW/glfw3.h"
+
+// Phase 4 Task 37-38: generated default shader blob (vs/fs SPIR-V + reflection
+// tables). Loaded via rlvkLoadShaderBlob during rlglInit; routes through the
+// per-shader pipeline cache for all default 2D batch rendering.
+#include "shaders/vulkan/default.rlvk.h"
 
 //----------------------------------------------------------------------------------
 // Embedded SPIR-V shaders (default vertex + fragment)
@@ -852,6 +860,12 @@ typedef struct rlvkContext {
     VkDeviceMemory indexMemory;
 
     VkPhysicalDeviceMemoryProperties memProperties;
+
+    // Shared frame UBO: per-frame buffers + persistently mapped writeback.
+    VkBuffer       frameUboBuffer[RLVK_MAX_FRAMES_IN_FLIGHT];
+    VkDeviceMemory frameUboMemory[RLVK_MAX_FRAMES_IN_FLIGHT];
+    void          *frameUboMapped[RLVK_MAX_FRAMES_IN_FLIGHT];
+    uint32_t       frameUboSize;
 } rlvkContext;
 
 #define RLVK_MAX_SHADERS 64
@@ -945,10 +959,16 @@ typedef struct rlvkState {
     // Shared frame UBO shadow (used when uniform location targets RLVK_FRAME_UBO_INDEX)
     unsigned char *frameUboShadow;
     uint32_t       frameUboShadowSize;
-    int            frameUboDirty;
+    int            frameUboDirty[RLVK_MAX_FRAMES_IN_FLIGHT];
+    const rlvk_uniform_entry *frameUboUniforms;
 
     // Phase 4 render state (input to pipeline cache key).
     rlvkRenderState current_render_state;
+
+    // Phase 4 dynamic state (Task 34): line width + scissor.
+    float    line_width;
+    int      scissor_enabled;
+    VkRect2D scissor;
 } rlvkState;
 
 static rlvkContext RLVK = { 0 };
@@ -1519,10 +1539,17 @@ static void rlvkWriteShaderDescriptors(rlvkShader *s)
     for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
         uint32_t n = 0, bi = 0, ii = 0;
         for (int i = 0; i < s->n_ubos; i++) {
-            if (s->ubos[i].shared) continue;   // Task 36 handles shared frame UBO
-            binfos[bi] = (VkDescriptorBufferInfo){
-                .buffer = s->ubos[i].buffer[f], .offset = 0, .range = s->ubos[i].size
-            };
+            VkBuffer buf;
+            VkDeviceSize range;
+            if (s->ubos[i].shared) {
+                if (!RLVK.frameUboBuffer[f]) continue;  // not declared yet — skip; Declare re-writes
+                buf = RLVK.frameUboBuffer[f];
+                range = RLVK.frameUboSize;
+            } else {
+                buf = s->ubos[i].buffer[f];
+                range = s->ubos[i].size;
+            }
+            binfos[bi] = (VkDescriptorBufferInfo){ .buffer = buf, .offset = 0, .range = range };
             writes[n++] = (VkWriteDescriptorSet){
                 .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
                 .dstSet = s->descriptor_sets[f][s->ubos[i].set],
@@ -2388,6 +2415,9 @@ RLAPI void rlglInit(int width, int height)
         .depth_test_enable = 0, .depth_mask = 1,
         .cull_enable = 0, .cull_mode = 0, .polygon_mode = 0, .topology = 0,
     };
+    RLVK_STATE.line_width = 1.0f;
+    RLVK_STATE.scissor_enabled = 0;
+    RLVK_STATE.scissor = (VkRect2D){ {0, 0}, {0, 0} };
 
     // Default cull distances
     RLVK_STATE.cullNear = RL_CULL_DISTANCE_NEAR;
@@ -2434,14 +2464,23 @@ RLAPI void rlglInit(int width, int height)
         RL_FREE(cache_blob);
     }
 
-    rlvkCreatePipeline();
+    // PHASE 4 (Task 37-38): the static rlvkCreatePipeline() and rlvk_default_*_spv
+    // arrays are kept dormant for now while the new shader-blob path becomes the
+    // runtime default. They are no longer bound by rlDrawRenderBatch.
+    // rlvkCreatePipeline();
     rlvkCreateVertexBuffers();
 
-    // Default texture/shader IDs (placeholder)
+    // Default texture ID (placeholder; defaultTexture registered slot 1 above).
     RLVK_STATE.defaultTextureId = 1;
     RLVK_STATE.currentTextureId = 1;
-    RLVK_STATE.defaultShaderId = 1;
-    RLVK_STATE.currentShaderId = 1;
+
+    // Phase 4 Task 38: load the default 2D batch shader through the new blob
+    // path. This populates RLVK_STATE.shaders[id] with shader modules,
+    // descriptor sets (texture0 sampler at set=0/binding=0), and a per-shader
+    // pipeline layout. rlvkGetPipeline() will lazily produce VkPipelines for
+    // the (shader, vertex-layout, render-state) tuple as the draw path needs.
+    RLVK_STATE.defaultShaderId = rlvkLoadShaderBlob(&default_blob);
+    RLVK_STATE.currentShaderId = RLVK_STATE.defaultShaderId;
     RLVK_STATE.defaultShaderLocs = (int *)RL_CALLOC(RL_MAX_SHADER_LOCATIONS, sizeof(int));
     RLVK_STATE.currentShaderLocs = RLVK_STATE.defaultShaderLocs;
 
@@ -2475,10 +2514,12 @@ RLAPI void rlglClose(void)
     vkDestroyBuffer(RLVK.device, RLVK.indexBuffer, NULL);
     vkFreeMemory(RLVK.device, RLVK.indexMemory, NULL);
 
-    // Destroy pipeline
-    vkDestroyPipeline(RLVK.device, RLVK.pipelineTriangles, NULL);
-    vkDestroyPipeline(RLVK.device, RLVK.pipelineLines, NULL);
-    vkDestroyPipelineLayout(RLVK.device, RLVK.pipelineLayout, NULL);
+    // PHASE 4 (Task 38): static default pipelines are no longer created.
+    // The per-shader pipeline cache (Task 30) and the shaders[] registry
+    // (released above via rlUnloadShaderProgram) own all VkPipelines.
+    // vkDestroyPipeline(RLVK.device, RLVK.pipelineTriangles, NULL);
+    // vkDestroyPipeline(RLVK.device, RLVK.pipelineLines, NULL);
+    // vkDestroyPipelineLayout(RLVK.device, RLVK.pipelineLayout, NULL);
 
     // Phase 4 Task 30: destroy any pipelines created via the cache table.
     for (uint32_t i = 0; i < RLVK_PIPELINE_CACHE_SIZE; i++) {
@@ -2527,6 +2568,16 @@ RLAPI void rlglClose(void)
 
     vkDestroyCommandPool(RLVK.device, RLVK.commandPool, NULL);
     rlvkCleanupSwapchain();
+
+    if (RLVK.frameUboSize > 0) {
+        for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
+            if (RLVK.frameUboMapped[f]) vkUnmapMemory(RLVK.device, RLVK.frameUboMemory[f]);
+            if (RLVK.frameUboBuffer[f]) vkDestroyBuffer(RLVK.device, RLVK.frameUboBuffer[f], NULL);
+            if (RLVK.frameUboMemory[f]) vkFreeMemory(RLVK.device, RLVK.frameUboMemory[f], NULL);
+        }
+        RL_FREE(RLVK_STATE.frameUboShadow);
+    }
+
     vkDestroyDevice(RLVK.device, NULL);
 
 #if !defined(NDEBUG)
@@ -2764,6 +2815,12 @@ RLAPI void rlUnloadRenderBatch(rlRenderBatch batch)
     RL_FREE(batch.draws);
 }
 
+// Phase 4 Task 38: forward declarations for the per-shader pipeline cache /
+// descriptor flush helpers, defined later in this file.
+static VkPipeline rlvkGetPipeline(unsigned shader_id, rlvkVertexLayout layout,
+                                  const rlvkRenderState *rs);
+static void rlvkFlushShaderForDraw(VkCommandBuffer cmd, uint32_t frame);
+
 RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
 {
     if (RLVK_STATE.vertexCounter > 0 && RLVK.frameBegun)
@@ -2819,50 +2876,77 @@ RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
         pc.colDiffuse[2] = 1.0f;
         pc.colDiffuse[3] = 1.0f;
 
-        vkCmdPushConstants(cmd, RLVK.pipelineLayout,
+        // Phase 4 Task 38: push-constants now flow through the per-shader
+        // pipeline layout from rlvkBuildPipelineLayout (same 80-byte
+        // mvp+colDiffuse range as the legacy RLVK.pipelineLayout). Resolve
+        // the active shader once per batch — the texture sampler still
+        // varies per-draw and is updated inside the loop.
+        unsigned int shader_id = RLVK_STATE.currentShaderId
+            ? RLVK_STATE.currentShaderId
+            : RLVK_STATE.defaultShaderId;
+        rlvkShader *active_shader = (shader_id && shader_id < RLVK_MAX_SHADERS)
+            ? &RLVK_STATE.shaders[shader_id] : NULL;
+        if (!active_shader || !active_shader->in_use) {
+            // Nothing to draw with — bail out and reset the batch below.
+            goto draw_done;
+        }
+
+        vkCmdPushConstants(cmd, active_shader->pipeline_layout,
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(rlvkPushConstants), &pc);
 
         // Iterate draw calls
         int vertexOffset = 0;
-        unsigned int lastBoundTex = 0;  // Track to avoid redundant descriptor binds
+        unsigned int lastBoundTex = 0;
         for (int i = 0; i < batch->drawCounter; i++)
         {
             int mode = batch->draws[i].mode;
             int count = batch->draws[i].vertexCount;
             if (count <= 0) continue;
 
-            // Bind texture descriptor set for this draw call
+            // Pick render-state topology based on draw mode.
+            rlvkRenderState rs = RLVK_STATE.current_render_state;
+            if (mode == RL_LINES) rs.topology = 1;       // VK_PRIMITIVE_TOPOLOGY_LINE_LIST
+            else if (mode == RL_TRIANGLES) rs.topology = 0;
+            else /* RL_QUADS */ rs.topology = 0;          // indexed TRIANGLE_LIST
+
+            // Re-route texture binding to the shader's sampler table. The
+            // default shader's first sampler entry is texture0 (set=0/binding=0);
+            // we update the cached tex-id and dirty the descriptor so
+            // rlvkFlushShaderForDraw rewrites the combined-image-sampler
+            // descriptor before the bind.
             unsigned int texId = batch->draws[i].textureId;
             if (texId == 0) texId = RLVK_STATE.defaultTextureId;
             if (texId != lastBoundTex) {
-                VkDescriptorSet ds = RLVK.defaultTexDescriptor;
-                if (texId < RLVK_MAX_TEXTURES && rlvkTextures[texId].active)
-                    ds = rlvkTextures[texId].descriptorSet;
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLayout,
-                    0, 1, &ds, 0, NULL);
+                if (active_shader->bound_sampler_texids[0] != (int)texId) {
+                    active_shader->bound_sampler_texids[0] = (int)texId;
+                    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++)
+                        active_shader->sampler_descriptor_dirty[f] = 1;
+                }
                 lastBoundTex = texId;
             }
 
-            if (mode == RL_LINES) {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineLines);
-                vkCmdDraw(cmd, count, 1, vertexOffset, 0);
-            }
-            else if (mode == RL_TRIANGLES) {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineTriangles);
-                vkCmdDraw(cmd, count, 1, vertexOffset, 0);
-            }
-            else if (mode == RL_QUADS) {
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, RLVK.pipelineTriangles);
+            VkPipeline p = rlvkGetPipeline(shader_id, RLVK_VLAYOUT_BATCH_2D, &rs);
+            if (!p) continue;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+
+            // Flush UBOs + sampler descriptors and bind descriptor sets for
+            // the active shader. Must happen after sampler-id update above so
+            // the combined-image-sampler descriptor is rewritten if needed.
+            rlvkFlushShaderForDraw(cmd, RLVK.currentFrame);
+
+            if (mode == RL_QUADS) {
                 vkCmdBindIndexBuffer(cmd, RLVK.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-                // For quads: every 4 vertices become 6 indices (2 triangles)
-                // Use firstIndex=0, vertexOffset=base so indices 0,1,2,0,2,3... are offset by base
                 int indexCount = (count / 4) * 6;
                 vkCmdDrawIndexed(cmd, indexCount, 1, 0, vertexOffset, 0);
+            }
+            else {
+                vkCmdDraw(cmd, count, 1, vertexOffset, 0);
             }
 
             vertexOffset += count;
         }
     }
+draw_done:;
 
     // Reset batch — zero EVERY draw call we used this frame, not just slot 0.
     // Otherwise draws[1..drawCounter-1].vertexCount keeps accumulating across
@@ -3044,37 +3128,61 @@ RLAPI void rlBlitFramebuffer(int srcX, int srcY, int srcWidth, int srcHeight, in
     { (void)srcX; (void)srcY; (void)srcWidth; (void)srcHeight; (void)dstX; (void)dstY; (void)dstWidth; (void)dstHeight; (void)bufferMask; }
 RLAPI void rlBindFramebuffer(unsigned int target, unsigned int framebuffer) { (void)target; (void)framebuffer; }
 
-// Render state
-RLAPI void rlEnableColorBlend(void) { }
-RLAPI void rlDisableColorBlend(void) { }
-RLAPI void rlEnableDepthTest(void) { }
-RLAPI void rlDisableDepthTest(void) { }
-RLAPI void rlEnableDepthMask(void) { }
-RLAPI void rlDisableDepthMask(void) { }
-RLAPI void rlEnableBackfaceCulling(void) { }
-RLAPI void rlDisableBackfaceCulling(void) { }
+// Render state (Phase 4 Task 33-34): writes feed pipeline cache key + dynamic state.
+RLAPI void rlEnableColorBlend(void)       { RLVK_STATE.current_render_state.blend_enable = 1; }
+RLAPI void rlDisableColorBlend(void)      { RLVK_STATE.current_render_state.blend_enable = 0; }
+RLAPI void rlEnableDepthTest(void)        { RLVK_STATE.current_render_state.depth_test_enable = 1; }
+RLAPI void rlDisableDepthTest(void)       { RLVK_STATE.current_render_state.depth_test_enable = 0; }
+RLAPI void rlEnableDepthMask(void)        { RLVK_STATE.current_render_state.depth_mask = 1; }
+RLAPI void rlDisableDepthMask(void)       { RLVK_STATE.current_render_state.depth_mask = 0; }
+RLAPI void rlEnableBackfaceCulling(void)  { RLVK_STATE.current_render_state.cull_enable = 1; }
+RLAPI void rlDisableBackfaceCulling(void) { RLVK_STATE.current_render_state.cull_enable = 0; }
 RLAPI void rlColorMask(bool r, bool g, bool b, bool a) { (void)r; (void)g; (void)b; (void)a; }
-RLAPI void rlSetCullFace(int mode) { (void)mode; }
-RLAPI void rlEnableScissorTest(void) { }
-RLAPI void rlDisableScissorTest(void) { }
-RLAPI void rlScissor(int x, int y, int width, int height) { (void)x; (void)y; (void)width; (void)height; }
-RLAPI void rlEnablePointMode(void) { }
-RLAPI void rlDisablePointMode(void) { }
+RLAPI void rlSetCullFace(int mode)        { RLVK_STATE.current_render_state.cull_mode = (uint8_t)mode; }
+RLAPI void rlEnableScissorTest(void)      { RLVK_STATE.scissor_enabled = 1; }
+RLAPI void rlDisableScissorTest(void)     { RLVK_STATE.scissor_enabled = 0; }
+RLAPI void rlScissor(int x, int y, int width, int height)
+{
+    RLVK_STATE.scissor_enabled = 1;
+    RLVK_STATE.scissor.offset.x = x;
+    RLVK_STATE.scissor.offset.y = y;
+    RLVK_STATE.scissor.extent.width  = (uint32_t)width;
+    RLVK_STATE.scissor.extent.height = (uint32_t)height;
+}
+RLAPI void rlEnablePointMode(void)  { RLVK_STATE.current_render_state.polygon_mode = 2; }
+RLAPI void rlDisablePointMode(void) { RLVK_STATE.current_render_state.polygon_mode = 0; }
 RLAPI void rlSetPointSize(float size) { (void)size; }
 RLAPI float rlGetPointSize(void) { return 1.0f; }
-RLAPI void rlEnableWireMode(void) { }
-RLAPI void rlDisableWireMode(void) { }
-RLAPI void rlSetLineWidth(float width) { (void)width; }
-RLAPI float rlGetLineWidth(void) { return 1.0f; }
-RLAPI void rlEnableSmoothLines(void) { }
+RLAPI void rlEnableWireMode(void)  { RLVK_STATE.current_render_state.polygon_mode = 1; }
+RLAPI void rlDisableWireMode(void) { RLVK_STATE.current_render_state.polygon_mode = 0; }
+RLAPI void rlSetLineWidth(float width) { RLVK_STATE.line_width = width; }
+RLAPI float rlGetLineWidth(void)       { return RLVK_STATE.line_width; }
+RLAPI void rlEnableSmoothLines(void)  { /* needs VK_EXT_line_rasterization; ignore for Phase 4 */ }
 RLAPI void rlDisableSmoothLines(void) { }
 RLAPI void rlEnableStereoRender(void) { }
 RLAPI void rlDisableStereoRender(void) { }
 RLAPI bool rlIsStereoRenderEnabled(void) { return false; }
-RLAPI void rlSetBlendMode(int mode) { (void)mode; }
-RLAPI void rlSetBlendFactors(int glSrcFactor, int glDstFactor, int glEquation) { (void)glSrcFactor; (void)glDstFactor; (void)glEquation; }
+RLAPI void rlSetBlendMode(int mode)
+{
+    RLVK_STATE.current_render_state.blend_mode = (uint8_t)mode;
+    RLVK_STATE.current_render_state.blend_enable = 1;
+}
+RLAPI void rlSetBlendFactors(int glSrcFactor, int glDstFactor, int glEquation)
+{
+    (void)glSrcFactor; (void)glDstFactor; (void)glEquation;
+    // Phase 4: custom blend factors land via SetBlendMode(RL_BLEND_CUSTOM)
+    // but the actual factor values are not yet honored by the pipeline cache.
+    // Fall back to alpha blend until Phase 5+.
+    RLVK_STATE.current_render_state.blend_mode = 0;
+    RLVK_STATE.current_render_state.blend_enable = 1;
+}
 RLAPI void rlSetBlendFactorsSeparate(int glSrcRGB, int glDstRGB, int glSrcAlpha, int glDstAlpha, int glEqRGB, int glEqAlpha)
-    { (void)glSrcRGB; (void)glDstRGB; (void)glSrcAlpha; (void)glDstAlpha; (void)glEqRGB; (void)glEqAlpha; }
+{
+    (void)glSrcRGB; (void)glDstRGB; (void)glSrcAlpha; (void)glDstAlpha; (void)glEqRGB; (void)glEqAlpha;
+    // Same Phase 4 limitation as rlSetBlendFactors; honored in Phase 5+.
+    RLVK_STATE.current_render_state.blend_mode = 0;
+    RLVK_STATE.current_render_state.blend_enable = 1;
+}
 
 // Vertex buffer management
 RLAPI unsigned int rlLoadVertexArray(void) { return 0; }
@@ -3321,7 +3429,7 @@ RLAPI void rlSetUniform(int locIndex, const void *value, int uniformType, int co
         if (!RLVK_STATE.frameUboShadow) return;
         if (offset + size > RLVK_STATE.frameUboShadowSize) return;
         memcpy(RLVK_STATE.frameUboShadow + offset, value, size);
-        RLVK_STATE.frameUboDirty = 1;
+        for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) RLVK_STATE.frameUboDirty[f] = 1;
         return;
     }
     if ((int)ubo_idx >= s->n_ubos) return;
@@ -3362,7 +3470,7 @@ RLAPI void rlSetUniformMatrix(int locIndex, Matrix mat)
         if (!RLVK_STATE.frameUboShadow) return;
         if (offset + 64 > RLVK_STATE.frameUboShadowSize) return;
         rlvkWriteMat4ColMajor(RLVK_STATE.frameUboShadow + offset, mat);
-        RLVK_STATE.frameUboDirty = 1;
+        for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) RLVK_STATE.frameUboDirty[f] = 1;
         return;
     }
     if ((int)ubo_idx >= s->n_ubos) return;
@@ -3378,6 +3486,59 @@ RLAPI void rlSetUniformMatrices(int locIndex, const Matrix *mat, int count)
         int loc = (locIndex & ~0x00FFFFFF) | ((rlvkLocOffset(locIndex) + (unsigned)(i * 64)) & 0x00FFFFFF);
         rlSetUniformMatrix(loc, mat[i]);
     }
+}
+
+// Phase 4 Tasks 35-36: shared frame UBO declaration / write / lookup.
+RLAPI void rlvkDeclareFrameUBO(size_t size, const rlvk_uniform_entry *uniforms)
+{
+    if (RLVK.frameUboSize != 0) {
+        TRACELOG(RL_LOG_WARNING, "VULKAN: Frame UBO already declared, ignoring re-declaration");
+        return;
+    }
+    RLVK.frameUboSize = (uint32_t)size;
+    RLVK_STATE.frameUboShadow = (unsigned char*)RL_CALLOC(1, size);
+    RLVK_STATE.frameUboShadowSize = (uint32_t)size;
+    RLVK_STATE.frameUboUniforms = uniforms;
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) RLVK_STATE.frameUboDirty[f] = 1;
+
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
+        rlvkCreateBuffer(size,
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &RLVK.frameUboBuffer[f], &RLVK.frameUboMemory[f]);
+        vkMapMemory(RLVK.device, RLVK.frameUboMemory[f], 0, size, 0, &RLVK.frameUboMapped[f]);
+    }
+
+    // Re-write descriptors for any shader already loaded that opts into the
+    // shared frame UBO (otherwise its set=0/binding=0 descriptor still points
+    // at nothing). Iterate registry, call rlvkWriteShaderDescriptors for any
+    // in-use shader whose blob has a shared UBO.
+    for (int i = 1; i < RLVK_MAX_SHADERS; i++) {
+        rlvkShader *s = &RLVK_STATE.shaders[i];
+        if (!s->in_use || !s->blob || !s->blob->ubos) continue;
+        int has_shared = 0;
+        for (const rlvk_ubo_entry *u = s->blob->ubos; u && u->size; u++) {
+            if (u->shared) { has_shared = 1; break; }
+        }
+        if (has_shared) rlvkWriteShaderDescriptors(s);
+    }
+}
+
+RLAPI void rlvkSetFrameUBO(const void *data)
+{
+    if (!RLVK_STATE.frameUboShadow || !data) return;
+    memcpy(RLVK_STATE.frameUboShadow, data, RLVK_STATE.frameUboShadowSize);
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) RLVK_STATE.frameUboDirty[f] = 1;
+}
+
+RLAPI int rlvkGetFrameUniformLocation(const char *name)
+{
+    if (!name || !RLVK_STATE.frameUboUniforms) return -1;
+    for (const rlvk_uniform_entry *u = RLVK_STATE.frameUboUniforms; u && u->name; u++) {
+        if (strcmp(u->name, name) == 0)
+            return rlvkEncodeUniformLoc(RLVK_FRAME_UBO_INDEX, u->offset);
+    }
+    return -1;
 }
 
 RLAPI void rlSetUniformSampler(int locIndex, unsigned int textureId)
@@ -3433,9 +3594,16 @@ static void rlvkFlushShaderForDraw(VkCommandBuffer cmd, uint32_t frame)
     rlvkShader *s = &RLVK_STATE.shaders[id];
     if (!s->in_use) return;
 
+    // Frame UBO upload (host-coherent persistent map).
+    if (RLVK_STATE.frameUboShadow && RLVK_STATE.frameUboDirty[frame] &&
+        RLVK.frameUboMapped[frame]) {
+        memcpy(RLVK.frameUboMapped[frame], RLVK_STATE.frameUboShadow, RLVK_STATE.frameUboShadowSize);
+        RLVK_STATE.frameUboDirty[frame] = 0;
+    }
+
     // Upload dirty per-shader UBOs via persistently-mapped buffers.
     for (int i = 0; i < s->n_ubos; i++) {
-        if (s->ubos[i].shared) continue;  // shared frame UBO handled in Task 36
+        if (s->ubos[i].shared) continue;  // shared frame UBO handled above
         if (!s->ubos[i].dirty) continue;
         memcpy(s->ubos[i].mapped[frame], s->ubos[i].shadow, s->ubos[i].size);
         s->ubos[i].dirty = 0;
@@ -3450,6 +3618,14 @@ static void rlvkFlushShaderForDraw(VkCommandBuffer cmd, uint32_t frame)
     }
     if (n) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
         s->pipeline_layout, 0, n, sets, 0, NULL);
+
+    // Apply scissor (dynamic). Falls back to full framebuffer when disabled.
+    VkRect2D sc = RLVK_STATE.scissor_enabled
+        ? RLVK_STATE.scissor
+        : (VkRect2D){ {0, 0}, { (uint32_t)RLVK_STATE.framebufferWidth,
+                                (uint32_t)RLVK_STATE.framebufferHeight } };
+    vkCmdSetScissor(cmd, 0, 1, &sc);
+    vkCmdSetLineWidth(cmd, RLVK_STATE.line_width);
 }
 
 // Phase 4 Task 30: lazy graphics-pipeline creation keyed by (shader, layout, render-state).
