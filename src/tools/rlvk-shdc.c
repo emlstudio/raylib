@@ -554,9 +554,6 @@ int main(int argc, char **argv)
     spirv_walk(vs, vs_n, collect_visitor, &Rvs); finalize_names(&Rvs);
     spirv_walk(fs, fs_n, collect_visitor, &Rfs); finalize_names(&Rfs);
 
-    fprintf(stderr, "rlvk-shdc: vs=%s fs=%s prefix=%s out=%s\n",
-            vs_path, fs_path, prefix, out_path);
-
     ubo_combined ubos[MAX_UBOS]; int n_ubos = 0;
     if (collect_ubos(&Rvs, ubos, &n_ubos, 1) < 0) return 1;
     if (collect_ubos(&Rfs, ubos, &n_ubos, 0) < 0) return 1;
@@ -564,6 +561,24 @@ int main(int argc, char **argv)
     sampler_ent samplers[MAX_SAMPLERS]; int n_samplers = 0;
     if (collect_samplers(&Rvs, samplers, &n_samplers) < 0) return 1;
     if (collect_samplers(&Rfs, samplers, &n_samplers) < 0) return 1;
+
+    // Reject any uniform-member name that also appears in the sampler list —
+    // the runtime location-encoding scheme would not be able to disambiguate.
+    for (int i = 0; i < n_ubos; i++) {
+        const spv_reflect *R = pick_reflect_for(ubos[i].type_id, &Rvs, &Rfs);
+        const spv_type *st = &R->types[ubos[i].type_id];
+        for (uint32_t m = 0; m < st->member_count; m++) {
+            const char *mn = st->member_names[m];
+            for (int s = 0; s < n_samplers; s++) {
+                if (strcmp(samplers[s].name, mn) == 0) {
+                    fprintf(stderr,
+                        "rlvk-shdc: name collision: '%s' declared as both uniform and sampler\n",
+                        mn);
+                    return 1;
+                }
+            }
+        }
+    }
 
     // Uppercase prefix for the include-guard macro.
     char up[64]; size_t pl = strlen(prefix);
@@ -588,6 +603,9 @@ int main(int argc, char **argv)
     emit_blob(out, prefix);
     fprintf(out, "\n#endif // RLVK_GEN_%s_H\n", up);
     fclose(out);
+
+    fprintf(stderr, "rlvk-shdc: vs=%s fs=%s prefix=%s out=%s\n",
+            vs_path, fs_path, prefix, out_path);
 
     free(vs);
     free(fs);

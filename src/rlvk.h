@@ -846,6 +846,40 @@ typedef struct rlvkContext {
     VkPhysicalDeviceMemoryProperties memProperties;
 } rlvkContext;
 
+#define RLVK_MAX_SHADERS 64
+
+typedef struct rlvkShader {
+    int in_use;
+    const rlvk_shader_blob *blob;  // borrowed pointer into user-owned blob
+
+    // Vulkan static resources (created in rlvkLoadShaderBlob)
+    VkShaderModule vs_module, fs_module;
+    VkDescriptorSetLayout set_layouts[RLVK_MAX_DESC_SETS];
+    uint8_t set_layout_used[RLVK_MAX_DESC_SETS];  // 1 if layout created
+    VkPipelineLayout pipeline_layout;
+
+    // Per-UBO resources
+    int n_ubos;
+    struct {
+        uint8_t  set, binding;
+        uint32_t size;
+        uint8_t  shared;
+        VkBuffer        buffer[RLVK_MAX_FRAMES_IN_FLIGHT];
+        VkDeviceMemory  memory[RLVK_MAX_FRAMES_IN_FLIGHT];
+        void           *mapped[RLVK_MAX_FRAMES_IN_FLIGHT];
+        unsigned char  *shadow;   // CPU shadow, size bytes
+        int             dirty;    // 1 = shadow differs from GPU buffer
+    } ubos[RLVK_MAX_UBOS_PER_SHADER];
+
+    // Descriptor pool + sets (one per frame-in-flight)
+    VkDescriptorPool descriptor_pool;
+    VkDescriptorSet  descriptor_sets[RLVK_MAX_FRAMES_IN_FLIGHT][RLVK_MAX_DESC_SETS];
+
+    // Sampler binding shadow
+    int bound_sampler_texids[16];
+    int sampler_descriptor_dirty[RLVK_MAX_FRAMES_IN_FLIGHT];
+} rlvkShader;
+
 // Internal rlgl-compatible state
 typedef struct rlvkState {
     int currentMatrixMode;
@@ -885,6 +919,8 @@ typedef struct rlvkState {
 
     // Active framebuffer
     unsigned int activeFramebuffer;
+
+    rlvkShader shaders[RLVK_MAX_SHADERS];
 } rlvkState;
 
 static rlvkContext RLVK = { 0 };
@@ -1201,6 +1237,222 @@ static void rlvkCreateDefaultTexture(void)
     rlvkTextures[1].height = 1;
     rlvkTextures[1].format = RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
     // descriptorSet will be set after rlvkCreateDescriptors
+}
+
+//----------------------------------------------------------------------------------
+// Shader loading (rlvkLoadShaderBlob and helpers)
+//----------------------------------------------------------------------------------
+static VkShaderModule rlvkCreateShaderModule(const uint32_t *code, size_t size_bytes)
+{
+    VkShaderModuleCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = size_bytes,
+        .pCode    = code,
+    };
+    VkShaderModule m = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(RLVK.device, &ci, NULL, &m);
+    if (r != VK_SUCCESS) TRACELOG(RL_LOG_ERROR, "VULKAN: vkCreateShaderModule failed (%d)", r);
+    return m;
+}
+
+static int rlvkAllocShaderSlot(void)
+{
+    for (int i = 1; i < RLVK_MAX_SHADERS; i++) {
+        if (!RLVK_STATE.shaders[i].in_use) {
+            memset(&RLVK_STATE.shaders[i], 0, sizeof(rlvkShader));
+            RLVK_STATE.shaders[i].in_use = 1;
+            return i;
+        }
+    }
+    return 0;
+}
+
+static void rlvkBuildDescriptorSetLayouts(rlvkShader *s)
+{
+    VkDescriptorSetLayoutBinding bindings[RLVK_MAX_DESC_SETS][16];
+    uint32_t count[RLVK_MAX_DESC_SETS] = {0};
+
+    // UBOs
+    for (const rlvk_ubo_entry *u = s->blob->ubos; u && u->size; u++) {
+        if (u->set >= RLVK_MAX_DESC_SETS) continue;
+        VkDescriptorSetLayoutBinding *b = &bindings[u->set][count[u->set]++];
+        *b = (VkDescriptorSetLayoutBinding){
+            .binding = u->binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+    }
+
+    // Samplers
+    for (const rlvk_sampler_entry *sa = s->blob->samplers; sa && sa->name; sa++) {
+        if (sa->set >= RLVK_MAX_DESC_SETS) continue;
+        VkDescriptorSetLayoutBinding *b = &bindings[sa->set][count[sa->set]++];
+        *b = (VkDescriptorSetLayoutBinding){
+            .binding = sa->binding,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+    }
+
+    for (int set = 0; set < RLVK_MAX_DESC_SETS; set++) {
+        if (count[set] == 0) continue;
+        VkDescriptorSetLayoutCreateInfo ci = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = count[set],
+            .pBindings    = bindings[set],
+        };
+        VkResult r = vkCreateDescriptorSetLayout(RLVK.device, &ci, NULL, &s->set_layouts[set]);
+        if (r == VK_SUCCESS) s->set_layout_used[set] = 1;
+        else TRACELOG(RL_LOG_ERROR, "VULKAN: vkCreateDescriptorSetLayout set=%d failed (%d)", set, r);
+    }
+}
+
+static void rlvkBuildPipelineLayout(rlvkShader *s)
+{
+    VkDescriptorSetLayout layouts[RLVK_MAX_DESC_SETS];
+    uint32_t n = 0;
+    for (int i = 0; i < RLVK_MAX_DESC_SETS; i++)
+        if (s->set_layout_used[i]) layouts[n++] = s->set_layouts[i];
+
+    VkPushConstantRange pushRange = {
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset = 0, .size = sizeof(rlvkPushConstants),
+    };
+
+    VkPipelineLayoutCreateInfo ci = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = n, .pSetLayouts = layouts,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &pushRange,
+    };
+    VkResult r = vkCreatePipelineLayout(RLVK.device, &ci, NULL, &s->pipeline_layout);
+    if (r != VK_SUCCESS) TRACELOG(RL_LOG_ERROR, "VULKAN: vkCreatePipelineLayout failed (%d)", r);
+}
+
+static void rlvkAllocShaderUBOs(rlvkShader *s)
+{
+    int idx = 0;
+    for (const rlvk_ubo_entry *u = s->blob->ubos; u && u->size; u++, idx++) {
+        if (idx >= RLVK_MAX_UBOS_PER_SHADER) break;
+        s->ubos[idx].set     = u->set;
+        s->ubos[idx].binding = u->binding;
+        s->ubos[idx].size    = u->size;
+        s->ubos[idx].shared  = u->shared;
+        if (u->shared) continue;  // shared frame UBO is owned by RLVK_STATE
+
+        s->ubos[idx].shadow = (unsigned char*)RL_CALLOC(1, u->size);
+        s->ubos[idx].dirty  = 1;
+
+        for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
+            rlvkCreateBuffer(
+                u->size,
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                &s->ubos[idx].buffer[f], &s->ubos[idx].memory[f]);
+            vkMapMemory(RLVK.device, s->ubos[idx].memory[f], 0, u->size, 0, &s->ubos[idx].mapped[f]);
+        }
+    }
+    s->n_ubos = idx;
+}
+
+static void rlvkAllocShaderDescriptors(rlvkShader *s)
+{
+    uint32_t n_ubo = 0, n_smp = 0, n_sets = 0;
+    for (int i = 0; i < RLVK_MAX_DESC_SETS; i++) if (s->set_layout_used[i]) n_sets++;
+    for (int i = 0; i < s->n_ubos; i++) (void)i, n_ubo++;
+    for (const rlvk_sampler_entry *sa = s->blob->samplers; sa && sa->name; sa++) n_smp++;
+
+    VkDescriptorPoolSize sizes[2];
+    uint32_t n_sizes = 0;
+    if (n_ubo > 0) sizes[n_sizes++] = (VkDescriptorPoolSize){ VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, n_ubo * RLVK_MAX_FRAMES_IN_FLIGHT };
+    if (n_smp > 0) sizes[n_sizes++] = (VkDescriptorPoolSize){ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, n_smp * RLVK_MAX_FRAMES_IN_FLIGHT };
+    if (n_sizes == 0) return;
+
+    VkDescriptorPoolCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .maxSets = n_sets * RLVK_MAX_FRAMES_IN_FLIGHT,
+        .poolSizeCount = n_sizes, .pPoolSizes = sizes,
+    };
+    vkCreateDescriptorPool(RLVK.device, &pci, NULL, &s->descriptor_pool);
+
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
+        VkDescriptorSetLayout layouts[RLVK_MAX_DESC_SETS];
+        int set_map[RLVK_MAX_DESC_SETS]; int n = 0;
+        for (int i = 0; i < RLVK_MAX_DESC_SETS; i++) {
+            if (s->set_layout_used[i]) { layouts[n] = s->set_layouts[i]; set_map[n] = i; n++; }
+        }
+        VkDescriptorSetAllocateInfo ai = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = s->descriptor_pool,
+            .descriptorSetCount = n, .pSetLayouts = layouts,
+        };
+        VkDescriptorSet tmp[RLVK_MAX_DESC_SETS];
+        vkAllocateDescriptorSets(RLVK.device, &ai, tmp);
+        for (int i = 0; i < n; i++) s->descriptor_sets[f][set_map[i]] = tmp[i];
+    }
+}
+
+static void rlvkWriteShaderDescriptors(rlvkShader *s)
+{
+    VkWriteDescriptorSet writes[32]; VkDescriptorBufferInfo binfos[32]; VkDescriptorImageInfo iinfos[16];
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
+        uint32_t n = 0, bi = 0, ii = 0;
+        for (int i = 0; i < s->n_ubos; i++) {
+            if (s->ubos[i].shared) continue;   // Task 36 handles shared frame UBO
+            binfos[bi] = (VkDescriptorBufferInfo){
+                .buffer = s->ubos[i].buffer[f], .offset = 0, .range = s->ubos[i].size
+            };
+            writes[n++] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = s->descriptor_sets[f][s->ubos[i].set],
+                .dstBinding = s->ubos[i].binding,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &binfos[bi],
+            };
+            bi++;
+        }
+        for (const rlvk_sampler_entry *sa = s->blob->samplers; sa && sa->name; sa++) {
+            iinfos[ii] = (VkDescriptorImageInfo){
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .imageView   = RLVK.defaultTexView,
+                .sampler     = RLVK.defaultSampler,
+            };
+            writes[n++] = (VkWriteDescriptorSet){
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = s->descriptor_sets[f][sa->set],
+                .dstBinding = sa->binding,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &iinfos[ii],
+            };
+            ii++;
+        }
+        if (n) vkUpdateDescriptorSets(RLVK.device, n, writes, 0, NULL);
+    }
+}
+
+unsigned int rlvkLoadShaderBlob(const rlvk_shader_blob *blob)
+{
+    if (!blob) return 0;
+    int id = rlvkAllocShaderSlot();
+    if (!id) { TRACELOG(RL_LOG_ERROR, "VULKAN: shader registry full"); return 0; }
+    rlvkShader *s = &RLVK_STATE.shaders[id];
+    s->blob = blob;
+
+    s->vs_module = rlvkCreateShaderModule(blob->vs_spv, blob->vs_size);
+    s->fs_module = rlvkCreateShaderModule(blob->fs_spv, blob->fs_size);
+    if (!s->vs_module || !s->fs_module) { s->in_use = 0; return 0; }
+
+    rlvkBuildDescriptorSetLayouts(s);
+    rlvkBuildPipelineLayout(s);
+    rlvkAllocShaderUBOs(s);
+    rlvkAllocShaderDescriptors(s);
+    rlvkWriteShaderDescriptors(s);
+
+    for (int i = 0; i < 16; i++) s->bound_sampler_texids[i] = -1;
+    return (unsigned int)id;
 }
 
 static void rlvkCreateDescriptors(void)
@@ -2012,6 +2264,11 @@ RLAPI void rlglClose(void)
 {
     vkDeviceWaitIdle(RLVK.device);
 
+    // Phase 4: release any shader resources still in flight.
+    for (int i = 1; i < RLVK_MAX_SHADERS; i++) {
+        if (RLVK_STATE.shaders[i].in_use) rlUnloadShaderProgram((unsigned int)i);
+    }
+
     rlUnloadRenderBatch(RLVK_STATE.defaultBatch);
     RL_FREE(RLVK_STATE.defaultShaderLocs);
 
@@ -2386,12 +2643,19 @@ RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
         }
     }
 
-    // Reset batch
+    // Reset batch — zero EVERY draw call we used this frame, not just slot 0.
+    // Otherwise draws[1..drawCounter-1].vertexCount keeps accumulating across
+    // frames; eventually the index-count for a quads draw exceeds the index
+    // buffer and Vulkan reads past the bound buffer, corrupting glyph quads
+    // beyond the first one in any post-shapes text run.
+    for (int i = 0; i < batch->drawCounter; i++) {
+        batch->draws[i].vertexCount = 0;
+        batch->draws[i].vertexAlignment = 0;
+    }
     RLVK_STATE.vertexCounter = 0;
     batch->currentDepth = 0.0f;
     batch->drawCounter = 1;
     batch->draws[0].mode = RL_QUADS;
-    batch->draws[0].vertexCount = 0;
     batch->draws[0].textureId = RLVK_STATE.defaultTextureId;
     batch->currentBuffer++;
     if (batch->currentBuffer >= batch->bufferCount) batch->currentBuffer = 0;
@@ -2697,11 +2961,13 @@ RLAPI unsigned int rlLoadTexture(const void *data, int width, int height, int fo
     };
     vkCreateImageView(RLVK.device, &viewInfo, NULL, &tex->view);
 
-    // Sampler (default: linear filtering)
+    // Sampler — default to NEAREST to match raylib's OpenGL backend (bitmap
+    // fonts and pixel-art textures rely on point sampling; users opt into
+    // bilinear via SetTextureFilter()).
     VkSamplerCreateInfo samplerInfo = {
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
-        .magFilter = VK_FILTER_LINEAR,
-        .minFilter = VK_FILTER_LINEAR,
+        .magFilter = VK_FILTER_NEAREST,
+        .minFilter = VK_FILTER_NEAREST,
         .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
         .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
         .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
@@ -2757,7 +3023,33 @@ RLAPI unsigned int rlLoadShaderProgram(const char *vsCode, const char *fsCode) {
 RLAPI unsigned int rlLoadShaderProgramEx(unsigned int vsId, unsigned int fsId) { (void)vsId; (void)fsId; return RLVK_STATE.defaultShaderId; }
 RLAPI unsigned int rlLoadShaderProgramCompute(unsigned int csId) { (void)csId; return 0; }
 RLAPI void rlUnloadShader(unsigned int id) { (void)id; }
-RLAPI void rlUnloadShaderProgram(unsigned int id) { (void)id; }
+RLAPI void rlUnloadShaderProgram(unsigned int id)
+{
+    if (id == 0 || id >= RLVK_MAX_SHADERS) return;
+    rlvkShader *s = &RLVK_STATE.shaders[id];
+    if (!s->in_use) return;
+
+    vkDeviceWaitIdle(RLVK.device);
+
+    for (int i = 0; i < s->n_ubos; i++) {
+        if (s->ubos[i].shared) continue;
+        for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
+            if (s->ubos[i].mapped[f]) vkUnmapMemory(RLVK.device, s->ubos[i].memory[f]);
+            if (s->ubos[i].buffer[f]) vkDestroyBuffer(RLVK.device, s->ubos[i].buffer[f], NULL);
+            if (s->ubos[i].memory[f]) vkFreeMemory(RLVK.device, s->ubos[i].memory[f], NULL);
+        }
+        RL_FREE(s->ubos[i].shadow);
+    }
+
+    if (s->descriptor_pool) vkDestroyDescriptorPool(RLVK.device, s->descriptor_pool, NULL);
+    for (int i = 0; i < RLVK_MAX_DESC_SETS; i++)
+        if (s->set_layout_used[i]) vkDestroyDescriptorSetLayout(RLVK.device, s->set_layouts[i], NULL);
+    if (s->pipeline_layout) vkDestroyPipelineLayout(RLVK.device, s->pipeline_layout, NULL);
+    if (s->vs_module) vkDestroyShaderModule(RLVK.device, s->vs_module, NULL);
+    if (s->fs_module) vkDestroyShaderModule(RLVK.device, s->fs_module, NULL);
+
+    memset(s, 0, sizeof(*s));
+}
 RLAPI int rlGetLocationUniform(unsigned int id, const char *uniformName) { (void)id; (void)uniformName; return -1; }
 RLAPI int rlGetLocationAttrib(unsigned int id, const char *attribName) { (void)id; (void)attribName; return -1; }
 RLAPI void rlSetUniform(int locIndex, const void *value, int uniformType, int count) { (void)locIndex; (void)value; (void)uniformType; (void)count; }

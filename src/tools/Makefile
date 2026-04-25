@@ -5,7 +5,7 @@ CC      ?= cc
 CFLAGS  ?= -O2 -std=c99 -Wall -Wextra -Wpedantic
 TOOL    = rlvk-shdc
 
-.PHONY: all clean test
+.PHONY: all clean test update-golden
 
 all: $(TOOL)
 
@@ -18,3 +18,6 @@ clean:
 
 test: $(TOOL)
 	bash tests/run_tests.sh
+
+update-golden: $(TOOL)
+	bash tests/update_golden.sh
