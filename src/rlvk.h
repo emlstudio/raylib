@@ -665,6 +665,13 @@ RLAPI void rlLoadDrawQuad(void);
     #include <sys/types.h>
 #endif
 
+// GLFW_INCLUDE_VULKAN: pulls in <vulkan/vulkan.h> AND enables GLFW's
+// Vulkan-specific entry points (glfwCreateWindowSurface, etc.).
+// GLFW_INCLUDE_NONE: suppresses GLFW's default <GL/gl.h> include, which
+// would otherwise force the Vulkan build to depend on a GL headers package
+// even though we never call any GL function (CI on Ubuntu doesn't install
+// libgl-dev because we don't need OpenGL).
+#define GLFW_INCLUDE_NONE
 #define GLFW_INCLUDE_VULKAN
 #include "external/glfw/include/GLFW/glfw3.h"
 
