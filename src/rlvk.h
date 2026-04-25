@@ -1563,7 +1563,10 @@ static inline int rlvkEncodeUniformLoc(unsigned ubo_idx, unsigned offset) {
 static inline int rlvkEncodeSamplerLoc(unsigned sampler_idx) {
     return (int)((1u << 31) | (sampler_idx & 0x00FFFFFFu));
 }
-static inline int rlvkLocIsSampler(int loc) { return loc >= 0 && ((unsigned)loc >> 31) != 0; }
+// Sampler locs have bit 31 set, which makes them negative when read as int.
+// `loc >= 0 && bit31` would be permanently false — check bit 31 alone, but
+// reject the all-bits-set "unbound" loc -1 (which also has bit 31 set).
+static inline int rlvkLocIsSampler(int loc) { return loc != -1 && ((unsigned)loc >> 31) != 0; }
 static inline unsigned rlvkLocUboIndex(int loc) { return ((unsigned)loc >> 24) & 0x7Fu; }
 static inline unsigned rlvkLocOffset(int loc)   { return (unsigned)loc & 0x00FFFFFFu; }
 
@@ -3327,6 +3330,23 @@ RLAPI void rlSetUniform(int locIndex, const void *value, int uniformType, int co
     s->ubos[ubo_idx].dirty = 1;
 }
 
+// raylib's Matrix struct is row-major in memory (raymath.h:6 and the field
+// declaration order m0,m4,m8,m12 / m1,m5,m9,m13 / ...). GLSL std140 mat4
+// expects column-major. Transpose into the shadow before upload — same
+// thing the OpenGL backend does via rlMatrixToFloat / glUniformMatrix4fv
+// (transpose=true). Without this, every mat4 uniform is delivered transposed.
+static inline void rlvkWriteMat4ColMajor(unsigned char *dst, Matrix m)
+{
+    float *d = (float *)dst;
+    const float *s = (const float *)&m;
+    // Source memory order: m0,m4,m8,m12, m1,m5,m9,m13, m2,m6,m10,m14, m3,m7,m11,m15
+    // Destination order  : column 0 (m0,m1,m2,m3), column 1 (m4,m5,m6,m7), ...
+    d[0]  = s[0];  d[1]  = s[4];  d[2]  = s[8];   d[3]  = s[12];
+    d[4]  = s[1];  d[5]  = s[5];  d[6]  = s[9];   d[7]  = s[13];
+    d[8]  = s[2];  d[9]  = s[6];  d[10] = s[10];  d[11] = s[14];
+    d[12] = s[3];  d[13] = s[7];  d[14] = s[11];  d[15] = s[15];
+}
+
 RLAPI void rlSetUniformMatrix(int locIndex, Matrix mat)
 {
     if (locIndex < 0 || rlvkLocIsSampler(locIndex)) return;
@@ -3341,13 +3361,13 @@ RLAPI void rlSetUniformMatrix(int locIndex, Matrix mat)
     if (ubo_idx == RLVK_FRAME_UBO_INDEX) {
         if (!RLVK_STATE.frameUboShadow) return;
         if (offset + 64 > RLVK_STATE.frameUboShadowSize) return;
-        memcpy(RLVK_STATE.frameUboShadow + offset, &mat, 64);
+        rlvkWriteMat4ColMajor(RLVK_STATE.frameUboShadow + offset, mat);
         RLVK_STATE.frameUboDirty = 1;
         return;
     }
     if ((int)ubo_idx >= s->n_ubos) return;
     if (offset + 64 > s->ubos[ubo_idx].size) return;
-    memcpy(s->ubos[ubo_idx].shadow + offset, &mat, 64);
+    rlvkWriteMat4ColMajor(s->ubos[ubo_idx].shadow + offset, mat);
     s->ubos[ubo_idx].dirty = 1;
 }
 
