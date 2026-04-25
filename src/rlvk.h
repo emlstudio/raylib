@@ -647,6 +647,13 @@ RLAPI void rlLoadDrawQuad(void);
 #include <string.h>
 #include <math.h>
 
+#if defined(_WIN32)
+    #include <direct.h>
+#else
+    #include <sys/stat.h>
+    #include <sys/types.h>
+#endif
+
 #define GLFW_INCLUDE_VULKAN
 #include "external/glfw/include/GLFW/glfw3.h"
 
@@ -824,6 +831,7 @@ typedef struct rlvkContext {
     VkPipelineLayout pipelineLayout;
     VkPipeline pipelineTriangles;
     VkPipeline pipelineLines;
+    VkPipelineCache pipelineCache;
     VkDescriptorSetLayout descriptorSetLayout;
 
     // Default texture
@@ -880,6 +888,18 @@ typedef struct rlvkShader {
     int sampler_descriptor_dirty[RLVK_MAX_FRAMES_IN_FLIGHT];
 } rlvkShader;
 
+// Phase 4 render state (hashed into pipeline cache key).
+typedef struct {
+    uint8_t blend_enable;
+    uint8_t blend_mode;
+    uint8_t depth_test_enable;
+    uint8_t depth_mask;
+    uint8_t cull_enable;
+    uint8_t cull_mode;
+    uint8_t polygon_mode;
+    uint8_t topology;
+} rlvkRenderState;
+
 // Internal rlgl-compatible state
 typedef struct rlvkState {
     int currentMatrixMode;
@@ -921,10 +941,110 @@ typedef struct rlvkState {
     unsigned int activeFramebuffer;
 
     rlvkShader shaders[RLVK_MAX_SHADERS];
+
+    // Shared frame UBO shadow (used when uniform location targets RLVK_FRAME_UBO_INDEX)
+    unsigned char *frameUboShadow;
+    uint32_t       frameUboShadowSize;
+    int            frameUboDirty;
+
+    // Phase 4 render state (input to pipeline cache key).
+    rlvkRenderState current_render_state;
 } rlvkState;
 
 static rlvkContext RLVK = { 0 };
 static rlvkState RLVK_STATE = { 0 };
+
+//----------------------------------------------------------------------------------
+// Phase 4: Pipeline cache (Tasks 27-31)
+//----------------------------------------------------------------------------------
+typedef struct {
+    unsigned int shader_id;
+    uint32_t     vertex_layout;
+    uint32_t     render_state_hash;
+} rlvkPipelineKey;
+
+typedef struct {
+    rlvkPipelineKey key;
+    VkPipeline      pipeline;
+    int             used;
+} rlvkPipelineEntry;
+
+#define RLVK_PIPELINE_CACHE_SIZE 256  // power of two
+static rlvkPipelineEntry RLVK_PIPELINES[RLVK_PIPELINE_CACHE_SIZE];
+
+static uint32_t rlvkHashKey(rlvkPipelineKey k)
+{
+    uint32_t h = 2166136261u;
+    h = (h ^ k.shader_id)         * 16777619u;
+    h = (h ^ k.vertex_layout)     * 16777619u;
+    h = (h ^ k.render_state_hash) * 16777619u;
+    return h;
+}
+
+typedef enum {
+    RLVK_VLAYOUT_BATCH_2D = 0,   // Phase 0-2 batch: pos, uv, normal, color (4 separate buffers)
+} rlvkVertexLayout;
+
+static void rlvkFillVertexInputState(rlvkVertexLayout layout,
+    VkVertexInputBindingDescription *out_bindings, uint32_t *n_bindings,
+    VkVertexInputAttributeDescription *out_attrs,  uint32_t *n_attrs)
+{
+    switch (layout) {
+    case RLVK_VLAYOUT_BATCH_2D: {
+        // Matches the existing Phase 0-2 default pipeline vertex input
+        // (see rlvkCreatePipeline near line ~1567): 4 separate bindings
+        // (position vec3, texcoord vec2, normal vec3, color RGBA8 unorm).
+        out_bindings[0] = (VkVertexInputBindingDescription){ 0, 3*sizeof(float),  VK_VERTEX_INPUT_RATE_VERTEX };
+        out_bindings[1] = (VkVertexInputBindingDescription){ 1, 2*sizeof(float),  VK_VERTEX_INPUT_RATE_VERTEX };
+        out_bindings[2] = (VkVertexInputBindingDescription){ 2, 3*sizeof(float),  VK_VERTEX_INPUT_RATE_VERTEX };
+        out_bindings[3] = (VkVertexInputBindingDescription){ 3, 4*sizeof(unsigned char), VK_VERTEX_INPUT_RATE_VERTEX };
+        *n_bindings = 4;
+        out_attrs[0] = (VkVertexInputAttributeDescription){ 0, 0, VK_FORMAT_R32G32B32_SFLOAT,  0 };
+        out_attrs[1] = (VkVertexInputAttributeDescription){ 1, 1, VK_FORMAT_R32G32_SFLOAT,     0 };
+        out_attrs[2] = (VkVertexInputAttributeDescription){ 2, 2, VK_FORMAT_R32G32B32_SFLOAT,  0 };
+        out_attrs[3] = (VkVertexInputAttributeDescription){ 3, 3, VK_FORMAT_R8G8B8A8_UNORM,    0 };
+        *n_attrs = 4;
+    } break;
+    }
+}
+
+static uint32_t rlvkHashRenderState(const rlvkRenderState *s)
+{
+    uint32_t h = 2166136261u;
+    const uint8_t *p = (const uint8_t*)s;
+    for (size_t i = 0; i < sizeof(*s); i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+
+// Pipeline-cache disk persistence helpers (Task 31).
+static const char *rlvkPlatformCacheDir(char *buf, size_t cap)
+{
+#if defined(_WIN32)
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base) return NULL;
+    snprintf(buf, cap, "%s\\raylib", base);
+#elif defined(__APPLE__)
+    const char *home = getenv("HOME"); if (!home) return NULL;
+    snprintf(buf, cap, "%s/Library/Caches/raylib", home);
+#else
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    if (xdg && xdg[0]) snprintf(buf, cap, "%s/raylib", xdg);
+    else {
+        const char *home = getenv("HOME"); if (!home) return NULL;
+        snprintf(buf, cap, "%s/.cache/raylib", home);
+    }
+#endif
+    return buf;
+}
+
+static void rlvkEnsureDir(const char *path)
+{
+#if defined(_WIN32)
+    _mkdir(path);
+#else
+    mkdir(path, 0755);
+#endif
+}
 
 //----------------------------------------------------------------------------------
 // Texture registry
@@ -1431,6 +1551,32 @@ static void rlvkWriteShaderDescriptors(rlvkShader *s)
         }
         if (n) vkUpdateDescriptorSets(RLVK.device, n, writes, 0, NULL);
     }
+}
+
+// Location encoding:
+//   bit 31       : 1 = sampler, 0 = UBO uniform
+//   bits 30..24  : UBO index (0..7 or RLVK_FRAME_UBO_INDEX=0x7F)
+//   bits 23..0   : byte offset (uniforms) or sampler table index (samplers)
+static inline int rlvkEncodeUniformLoc(unsigned ubo_idx, unsigned offset) {
+    return (int)(((ubo_idx & 0x7Fu) << 24) | (offset & 0x00FFFFFFu));
+}
+static inline int rlvkEncodeSamplerLoc(unsigned sampler_idx) {
+    return (int)((1u << 31) | (sampler_idx & 0x00FFFFFFu));
+}
+static inline int rlvkLocIsSampler(int loc) { return loc >= 0 && ((unsigned)loc >> 31) != 0; }
+static inline unsigned rlvkLocUboIndex(int loc) { return ((unsigned)loc >> 24) & 0x7Fu; }
+static inline unsigned rlvkLocOffset(int loc)   { return (unsigned)loc & 0x00FFFFFFu; }
+
+static uint32_t rlvkUniformTypeSize(int type, int count)
+{
+    static const uint32_t base[13] = {
+        4,  8, 12, 16,
+        4,  8, 12, 16,
+        4,  8, 12, 16,
+        0,
+    };
+    if (type < 0 || type > 12) return 0;
+    return base[type] * (uint32_t)(count > 0 ? count : 1);
 }
 
 unsigned int rlvkLoadShaderBlob(const rlvk_shader_blob *blob)
@@ -1942,9 +2088,16 @@ static void rlvkCreateSwapchain(int width, int height)
     VkSurfaceFormatKHR *fmts = RL_MALLOC(fmtCount * sizeof(VkSurfaceFormatKHR));
     vkGetPhysicalDeviceSurfaceFormatsKHR(RLVK.physicalDevice, RLVK.surface, &fmtCount, fmts);
 
+    // Prefer a UNORM swapchain so the shader's raw byte color values land on
+    // screen as-is. An SRGB swapchain would apply linear->sRGB gamma encoding
+    // at present time, making raylib's color constants look washed-out
+    // (raylib treats Color {r,g,b,a} as the literal display bytes, matching
+    // the OpenGL backend's default non-sRGB framebuffer).
     VkSurfaceFormatKHR surfFmt = fmts[0];
     for (uint32_t i = 0; i < fmtCount; i++) {
-        if (fmts[i].format == VK_FORMAT_B8G8R8A8_SRGB && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+        if ((fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM ||
+             fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM) &&
+            fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
             surfFmt = fmts[i];
             break;
         }
@@ -2226,6 +2379,13 @@ RLAPI void rlglInit(int width, int height)
     RLVK_STATE.currentMatrixMode = RL_MODELVIEW;
     RLVK_STATE.stackCounter = 0;
 
+    // Phase 4: default render-state seed (input to pipeline cache key).
+    RLVK_STATE.current_render_state = (rlvkRenderState){
+        .blend_enable = 1, .blend_mode = 0,
+        .depth_test_enable = 0, .depth_mask = 1,
+        .cull_enable = 0, .cull_mode = 0, .polygon_mode = 0, .topology = 0,
+    };
+
     // Default cull distances
     RLVK_STATE.cullNear = RL_CULL_DISTANCE_NEAR;
     RLVK_STATE.cullFar = RL_CULL_DISTANCE_FAR;
@@ -2242,6 +2402,35 @@ RLAPI void rlglInit(int width, int height)
     // Create Vulkan resources: default texture, descriptors, pipeline, vertex buffers
     rlvkCreateDefaultTexture();
     rlvkCreateDescriptors();
+
+    // Phase 4 Task 31: pipeline cache - load from disk if present, create empty otherwise.
+    {
+        char dir[512]; char file[600]; void *cache_blob = NULL; size_t cache_size = 0;
+        if (rlvkPlatformCacheDir(dir, sizeof(dir))) {
+            rlvkEnsureDir(dir);
+            snprintf(file, sizeof(file), "%s/pipeline_cache.bin", dir);
+            FILE *f = fopen(file, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                if (sz > 0) {
+                    cache_blob = RL_MALLOC((size_t)sz);
+                    if (cache_blob) {
+                        if (fread(cache_blob, 1, (size_t)sz, f) == (size_t)sz) cache_size = (size_t)sz;
+                        else { RL_FREE(cache_blob); cache_blob = NULL; }
+                    }
+                }
+                fclose(f);
+            }
+        }
+        VkPipelineCacheCreateInfo pcci = {
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
+            .initialDataSize = cache_size,
+            .pInitialData = cache_blob,
+        };
+        vkCreatePipelineCache(RLVK.device, &pcci, NULL, &RLVK.pipelineCache);
+        RL_FREE(cache_blob);
+    }
+
     rlvkCreatePipeline();
     rlvkCreateVertexBuffers();
 
@@ -2287,6 +2476,35 @@ RLAPI void rlglClose(void)
     vkDestroyPipeline(RLVK.device, RLVK.pipelineTriangles, NULL);
     vkDestroyPipeline(RLVK.device, RLVK.pipelineLines, NULL);
     vkDestroyPipelineLayout(RLVK.device, RLVK.pipelineLayout, NULL);
+
+    // Phase 4 Task 30: destroy any pipelines created via the cache table.
+    for (uint32_t i = 0; i < RLVK_PIPELINE_CACHE_SIZE; i++) {
+        if (RLVK_PIPELINES[i].used && RLVK_PIPELINES[i].pipeline) {
+            vkDestroyPipeline(RLVK.device, RLVK_PIPELINES[i].pipeline, NULL);
+        }
+    }
+
+    // Phase 4 Task 31: serialize VkPipelineCache to disk, then destroy.
+    if (RLVK.pipelineCache) {
+        size_t sz = 0;
+        vkGetPipelineCacheData(RLVK.device, RLVK.pipelineCache, &sz, NULL);
+        if (sz > 0) {
+            void *data = RL_MALLOC(sz);
+            if (data) {
+                if (vkGetPipelineCacheData(RLVK.device, RLVK.pipelineCache, &sz, data) == VK_SUCCESS) {
+                    char dir[512], file[600];
+                    if (rlvkPlatformCacheDir(dir, sizeof(dir))) {
+                        rlvkEnsureDir(dir);
+                        snprintf(file, sizeof(file), "%s/pipeline_cache.bin", dir);
+                        FILE *f = fopen(file, "wb");
+                        if (f) { fwrite(data, 1, sz, f); fclose(f); }
+                    }
+                }
+                RL_FREE(data);
+            }
+        }
+        vkDestroyPipelineCache(RLVK.device, RLVK.pipelineCache, NULL);
+    }
 
     // Destroy descriptors
     vkDestroyDescriptorPool(RLVK.device, RLVK.descriptorPool, NULL);
@@ -2802,8 +3020,17 @@ RLAPI void rlTextureParameters(unsigned int id, int param, int value) { (void)id
 RLAPI void rlCubemapParameters(unsigned int id, int param, int value) { (void)id; (void)param; (void)value; }
 
 // Shader state
-RLAPI void rlEnableShader(unsigned int id) { (void)id; }
-RLAPI void rlDisableShader(void) { }
+RLAPI void rlEnableShader(unsigned int id)
+{
+    if (id == 0 || id >= RLVK_MAX_SHADERS) { rlDisableShader(); return; }
+    if (!RLVK_STATE.shaders[id].in_use)    { rlDisableShader(); return; }
+    RLVK_STATE.currentShaderId = id;
+}
+
+RLAPI void rlDisableShader(void)
+{
+    RLVK_STATE.currentShaderId = RLVK_STATE.defaultShaderId;
+}
 
 // Framebuffer state
 RLAPI void rlEnableFramebuffer(unsigned int id) { RLVK_STATE.activeFramebuffer = id; }
@@ -3050,12 +3277,301 @@ RLAPI void rlUnloadShaderProgram(unsigned int id)
 
     memset(s, 0, sizeof(*s));
 }
-RLAPI int rlGetLocationUniform(unsigned int id, const char *uniformName) { (void)id; (void)uniformName; return -1; }
-RLAPI int rlGetLocationAttrib(unsigned int id, const char *attribName) { (void)id; (void)attribName; return -1; }
-RLAPI void rlSetUniform(int locIndex, const void *value, int uniformType, int count) { (void)locIndex; (void)value; (void)uniformType; (void)count; }
-RLAPI void rlSetUniformMatrix(int locIndex, Matrix mat) { (void)locIndex; (void)mat; }
-RLAPI void rlSetUniformMatrices(int locIndex, const Matrix *mat, int count) { (void)locIndex; (void)mat; (void)count; }
-RLAPI void rlSetUniformSampler(int locIndex, unsigned int textureId) { (void)locIndex; (void)textureId; }
+RLAPI int rlGetLocationUniform(unsigned int id, const char *uniformName)
+{
+    if (id == 0 || id >= RLVK_MAX_SHADERS || !uniformName) return -1;
+    rlvkShader *s = &RLVK_STATE.shaders[id];
+    if (!s->in_use) return -1;
+
+    int idx = 0;
+    for (const rlvk_sampler_entry *sa = s->blob->samplers; sa && sa->name; sa++, idx++) {
+        if (strcmp(sa->name, uniformName) == 0) return rlvkEncodeSamplerLoc((unsigned)idx);
+    }
+    for (const rlvk_uniform_entry *u = s->blob->uniforms; u && u->name; u++) {
+        if (strcmp(u->name, uniformName) == 0)
+            return rlvkEncodeUniformLoc(u->ubo_index, u->offset);
+    }
+    return -1;
+}
+
+RLAPI int rlGetLocationAttrib(unsigned int id, const char *attribName)
+{
+    (void)id; (void)attribName;
+    // Phase 4: attributes are fixed by the batch layout. Phase 5 will reflect attrib names.
+    return -1;
+}
+
+RLAPI void rlSetUniform(int locIndex, const void *value, int uniformType, int count)
+{
+    if (locIndex < 0 || rlvkLocIsSampler(locIndex)) return;
+    unsigned int id = RLVK_STATE.currentShaderId;
+    if (id == 0 || id >= RLVK_MAX_SHADERS) return;
+    rlvkShader *s = &RLVK_STATE.shaders[id];
+    if (!s->in_use) return;
+
+    unsigned ubo_idx = rlvkLocUboIndex(locIndex);
+    unsigned offset  = rlvkLocOffset(locIndex);
+    uint32_t size    = rlvkUniformTypeSize(uniformType, count);
+    if (size == 0) return;
+
+    if (ubo_idx == RLVK_FRAME_UBO_INDEX) {
+        if (!RLVK_STATE.frameUboShadow) return;
+        if (offset + size > RLVK_STATE.frameUboShadowSize) return;
+        memcpy(RLVK_STATE.frameUboShadow + offset, value, size);
+        RLVK_STATE.frameUboDirty = 1;
+        return;
+    }
+    if ((int)ubo_idx >= s->n_ubos) return;
+    if (offset + size > s->ubos[ubo_idx].size) return;
+    memcpy(s->ubos[ubo_idx].shadow + offset, value, size);
+    s->ubos[ubo_idx].dirty = 1;
+}
+
+RLAPI void rlSetUniformMatrix(int locIndex, Matrix mat)
+{
+    if (locIndex < 0 || rlvkLocIsSampler(locIndex)) return;
+    unsigned int id = RLVK_STATE.currentShaderId;
+    if (id == 0 || id >= RLVK_MAX_SHADERS) return;
+    rlvkShader *s = &RLVK_STATE.shaders[id];
+    if (!s->in_use) return;
+
+    unsigned ubo_idx = rlvkLocUboIndex(locIndex);
+    unsigned offset  = rlvkLocOffset(locIndex);
+
+    if (ubo_idx == RLVK_FRAME_UBO_INDEX) {
+        if (!RLVK_STATE.frameUboShadow) return;
+        if (offset + 64 > RLVK_STATE.frameUboShadowSize) return;
+        memcpy(RLVK_STATE.frameUboShadow + offset, &mat, 64);
+        RLVK_STATE.frameUboDirty = 1;
+        return;
+    }
+    if ((int)ubo_idx >= s->n_ubos) return;
+    if (offset + 64 > s->ubos[ubo_idx].size) return;
+    memcpy(s->ubos[ubo_idx].shadow + offset, &mat, 64);
+    s->ubos[ubo_idx].dirty = 1;
+}
+
+RLAPI void rlSetUniformMatrices(int locIndex, const Matrix *mat, int count)
+{
+    for (int i = 0; i < count; i++) {
+        // std140 mat4 stride is 64 bytes; the encoded location stores byte offset.
+        int loc = (locIndex & ~0x00FFFFFF) | ((rlvkLocOffset(locIndex) + (unsigned)(i * 64)) & 0x00FFFFFF);
+        rlSetUniformMatrix(loc, mat[i]);
+    }
+}
+
+RLAPI void rlSetUniformSampler(int locIndex, unsigned int textureId)
+{
+    if (!rlvkLocIsSampler(locIndex)) return;
+    unsigned int id = RLVK_STATE.currentShaderId;
+    if (id == 0 || id >= RLVK_MAX_SHADERS) return;
+    rlvkShader *s = &RLVK_STATE.shaders[id];
+    if (!s->in_use) return;
+
+    unsigned smp_idx = rlvkLocOffset(locIndex);
+    if (smp_idx >= 16) return;
+    s->bound_sampler_texids[smp_idx] = (int)textureId;
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) s->sampler_descriptor_dirty[f] = 1;
+}
+
+static void rlvkFlushSamplerDescriptors(rlvkShader *s, uint32_t frame)
+{
+    if (!s->sampler_descriptor_dirty[frame]) return;
+    VkWriteDescriptorSet writes[16]; VkDescriptorImageInfo infos[16];
+    uint32_t n = 0; int idx = 0;
+    for (const rlvk_sampler_entry *sa = s->blob->samplers; sa && sa->name; sa++, idx++) {
+        int tex_id = s->bound_sampler_texids[idx];
+        VkImageView view = RLVK.defaultTexView;
+        VkSampler   smp  = RLVK.defaultSampler;
+        if (tex_id > 0 && tex_id < (int)RLVK_MAX_TEXTURES) {
+            rlvkTexture *t = &rlvkTextures[tex_id];
+            if (t->active) { view = t->view; smp = t->sampler; }
+        }
+        infos[n] = (VkDescriptorImageInfo){
+            .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .imageView   = view,
+            .sampler     = smp,
+        };
+        writes[n] = (VkWriteDescriptorSet){
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = s->descriptor_sets[frame][sa->set],
+            .dstBinding = sa->binding,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &infos[n],
+        };
+        n++;
+    }
+    if (n) vkUpdateDescriptorSets(RLVK.device, n, writes, 0, NULL);
+    s->sampler_descriptor_dirty[frame] = 0;
+}
+
+static void rlvkFlushShaderForDraw(VkCommandBuffer cmd, uint32_t frame)
+{
+    unsigned id = RLVK_STATE.currentShaderId;
+    if (id == 0 || id >= RLVK_MAX_SHADERS) return;
+    rlvkShader *s = &RLVK_STATE.shaders[id];
+    if (!s->in_use) return;
+
+    // Upload dirty per-shader UBOs via persistently-mapped buffers.
+    for (int i = 0; i < s->n_ubos; i++) {
+        if (s->ubos[i].shared) continue;  // shared frame UBO handled in Task 36
+        if (!s->ubos[i].dirty) continue;
+        memcpy(s->ubos[i].mapped[frame], s->ubos[i].shadow, s->ubos[i].size);
+        s->ubos[i].dirty = 0;
+    }
+    rlvkFlushSamplerDescriptors(s, frame);
+
+    // Bind any used descriptor sets (Phase 4 assumes contiguous from set 0).
+    VkDescriptorSet sets[RLVK_MAX_DESC_SETS]; uint32_t n = 0;
+    for (int i = 0; i < RLVK_MAX_DESC_SETS; i++) {
+        if (!s->set_layout_used[i]) break;
+        sets[n++] = s->descriptor_sets[frame][i];
+    }
+    if (n) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        s->pipeline_layout, 0, n, sets, 0, NULL);
+}
+
+// Phase 4 Task 30: lazy graphics-pipeline creation keyed by (shader, layout, render-state).
+// This lives alongside the Phase 0-2 default pipelines (RLVK.pipelineTriangles /
+// pipelineLines); Tasks 37-38 will route the draw path through rlvkGetPipeline and
+// retire those static pipelines. Named `rlvkCreatePipelineForShader` to avoid
+// colliding with the Phase 0-2 `rlvkCreatePipeline(void)` that builds the static
+// triangle/line pipelines.
+static VkPipeline rlvkCreatePipelineForShader(unsigned shader_id, rlvkVertexLayout layout,
+                                              const rlvkRenderState *rs)
+{
+    rlvkShader *s = &RLVK_STATE.shaders[shader_id];
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_VERTEX_BIT,   .module = s->vs_module, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+          .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = s->fs_module, .pName = "main" },
+    };
+
+    VkVertexInputBindingDescription vb[4]; VkVertexInputAttributeDescription va[8];
+    uint32_t nvb = 0, nva = 0;
+    rlvkFillVertexInputState(layout, vb, &nvb, va, &nva);
+    VkPipelineVertexInputStateCreateInfo vi = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount = nvb, .pVertexBindingDescriptions = vb,
+        .vertexAttributeDescriptionCount = nva, .pVertexAttributeDescriptions = va,
+    };
+
+    VkPrimitiveTopology topo = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    if (rs->topology == 1) topo = VK_PRIMITIVE_TOPOLOGY_LINE_LIST;
+    if (rs->topology == 2) topo = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
+    VkPipelineInputAssemblyStateCreateInfo ia = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = topo,
+    };
+
+    VkPolygonMode pm = VK_POLYGON_MODE_FILL;
+    if (rs->polygon_mode == 1) pm = VK_POLYGON_MODE_LINE;
+    if (rs->polygon_mode == 2) pm = VK_POLYGON_MODE_POINT;
+    VkPipelineRasterizationStateCreateInfo rz = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = pm,
+        .lineWidth = 1.0f,
+        .cullMode = rs->cull_enable ? (rs->cull_mode ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_BACK_BIT) : VK_CULL_MODE_NONE,
+        .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+    };
+
+    VkPipelineDepthStencilStateCreateInfo ds = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+        .depthTestEnable  = rs->depth_test_enable,
+        .depthWriteEnable = rs->depth_mask,
+        .depthCompareOp   = VK_COMPARE_OP_LESS,
+    };
+
+    VkPipelineColorBlendAttachmentState cba = {
+        .blendEnable = rs->blend_enable,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+        .colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       |  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT,
+    };
+    // Built-in blend modes - match raylib's RL_BLEND_*.
+    switch (rs->blend_mode) {
+    case 0: /* RL_BLEND_ALPHA */ break; // defaults above
+    case 1: /* RL_BLEND_ADDITIVE */
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        break;
+    case 2: /* RL_BLEND_MULTIPLIED */
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        break;
+    case 3: /* RL_BLEND_ADD_COLORS */
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        break;
+    default: break;
+    }
+
+    VkPipelineColorBlendStateCreateInfo cb = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1, .pAttachments = &cba,
+    };
+    VkPipelineViewportStateCreateInfo vp = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1, .scissorCount = 1,
+    };
+    VkPipelineMultisampleStateCreateInfo ms = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+    };
+    VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_LINE_WIDTH };
+    VkPipelineDynamicStateCreateInfo dy = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 3, .pDynamicStates = dyn,
+    };
+
+    VkGraphicsPipelineCreateInfo pci = {
+        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount = 2, .pStages = stages,
+        .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+        .pViewportState = &vp, .pRasterizationState = &rz,
+        .pDepthStencilState = &ds, .pColorBlendState = &cb,
+        .pMultisampleState = &ms, .pDynamicState = &dy,
+        .layout = s->pipeline_layout,
+        .renderPass = RLVK.renderPass, .subpass = 0,
+    };
+    VkPipeline p = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(RLVK.device, RLVK.pipelineCache, 1, &pci, NULL, &p);
+    if (r != VK_SUCCESS) TRACELOG(RL_LOG_ERROR, "VULKAN: vkCreateGraphicsPipelines failed (%d)", r);
+    return p;
+}
+
+static VkPipeline rlvkGetPipeline(unsigned shader_id, rlvkVertexLayout layout,
+                                  const rlvkRenderState *rs)
+{
+    rlvkPipelineKey k = { shader_id, (uint32_t)layout, rlvkHashRenderState(rs) };
+    uint32_t h = rlvkHashKey(k) & (RLVK_PIPELINE_CACHE_SIZE - 1);
+    for (uint32_t i = 0; i < RLVK_PIPELINE_CACHE_SIZE; i++) {
+        uint32_t idx = (h + i) & (RLVK_PIPELINE_CACHE_SIZE - 1);
+        rlvkPipelineEntry *e = &RLVK_PIPELINES[idx];
+        if (!e->used) {
+            e->key = k;
+            e->pipeline = rlvkCreatePipelineForShader(shader_id, layout, rs);
+            e->used = 1;
+            return e->pipeline;
+        }
+        if (e->key.shader_id == k.shader_id &&
+            e->key.vertex_layout == k.vertex_layout &&
+            e->key.render_state_hash == k.render_state_hash) {
+            return e->pipeline;
+        }
+    }
+    TRACELOG(RL_LOG_ERROR, "VULKAN: pipeline cache full");
+    return VK_NULL_HANDLE;
+}
+
 RLAPI void rlSetShader(unsigned int id, int *locs) {
     if (id != RLVK_STATE.currentShaderId) {
         rlDrawRenderBatchActive();
