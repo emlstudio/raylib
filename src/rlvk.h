@@ -600,6 +600,13 @@ RLAPI void rlUnloadShader(unsigned int id);
 RLAPI void rlUnloadShaderProgram(unsigned int id);
 RLAPI int rlGetLocationUniform(unsigned int id, const char *uniformName);
 RLAPI int rlGetLocationAttrib(unsigned int id, const char *attribName);
+// Phase 4 Task 40: convenience helper for examples loading a generated shader
+// blob. Returns a freshly-allocated int[RL_MAX_SHADER_LOCATIONS] populated by
+// matching the blob's reflection table against raylib's standard attribute /
+// uniform / sampler names. Slots not present in the blob are -1. Caller owns
+// the array (RL_FREE when done, or assign to Shader.locs and let UnloadShader
+// release it).
+RLAPI int *GetShaderLocsAuto(unsigned int shaderId);
 RLAPI void rlvkDeclareFrameUBO(size_t size, const rlvk_uniform_entry *uniforms);
 RLAPI void rlvkSetFrameUBO(const void *data);
 RLAPI int  rlvkGetFrameUniformLocation(const char *name);
@@ -877,7 +884,9 @@ typedef struct rlvkShader {
     // Vulkan static resources (created in rlvkLoadShaderBlob)
     VkShaderModule vs_module, fs_module;
     VkDescriptorSetLayout set_layouts[RLVK_MAX_DESC_SETS];
-    uint8_t set_layout_used[RLVK_MAX_DESC_SETS];  // 1 if layout created
+    uint8_t set_layout_used[RLVK_MAX_DESC_SETS];   // 1 if layout in use
+    uint8_t set_layout_owned[RLVK_MAX_DESC_SETS];  // 1 if we created it (must destroy);
+                                                   // 0 if borrowed from RLVK.descriptorSetLayout
     VkPipelineLayout pipeline_layout;
 
     // Per-UBO resources
@@ -890,7 +899,11 @@ typedef struct rlvkShader {
         VkDeviceMemory  memory[RLVK_MAX_FRAMES_IN_FLIGHT];
         void           *mapped[RLVK_MAX_FRAMES_IN_FLIGHT];
         unsigned char  *shadow;   // CPU shadow, size bytes
-        int             dirty;    // 1 = shadow differs from GPU buffer
+        // Dirty flag is per-frame-in-flight: each frame's GPU buffer needs
+        // its own upload, so a single shadow write must dirty every frame's
+        // copy. (A single int here would cause frame N+1 to skip upload after
+        // frame N consumed the dirty bit.)
+        int             dirty[RLVK_MAX_FRAMES_IN_FLIGHT];
     } ubos[RLVK_MAX_UBOS_PER_SHADER];
 
     // Descriptor pool + sets (one per frame-in-flight)
@@ -1438,13 +1451,35 @@ static void rlvkBuildDescriptorSetLayouts(rlvkShader *s)
 
     for (int set = 0; set < RLVK_MAX_DESC_SETS; set++) {
         if (count[set] == 0) continue;
+
+        // If this set is exactly the standard "set 0 = single texture0
+        // sampler" shape, reuse RLVK.descriptorSetLayout. Per-texture
+        // descriptor sets are allocated against that layout, and Metal
+        // (via MoltenVK) requires the EXACT same VkDescriptorSetLayout
+        // object — logical compatibility isn't enough to ensure the
+        // argument-buffer schema matches. Sharing the layout means
+        // any tex->descriptorSet binds correctly into any shader.
+        if (set == 0 && count[set] == 1
+            && bindings[set][0].binding == 0
+            && bindings[set][0].descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+            && bindings[set][0].descriptorCount == 1
+            && RLVK.descriptorSetLayout != VK_NULL_HANDLE) {
+            s->set_layouts[set]      = RLVK.descriptorSetLayout;
+            s->set_layout_used[set]  = 1;
+            s->set_layout_owned[set] = 0;     // borrowed; do not destroy
+            continue;
+        }
+
         VkDescriptorSetLayoutCreateInfo ci = {
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .bindingCount = count[set],
             .pBindings    = bindings[set],
         };
         VkResult r = vkCreateDescriptorSetLayout(RLVK.device, &ci, NULL, &s->set_layouts[set]);
-        if (r == VK_SUCCESS) s->set_layout_used[set] = 1;
+        if (r == VK_SUCCESS) {
+            s->set_layout_used[set]  = 1;
+            s->set_layout_owned[set] = 1;
+        }
         else TRACELOG(RL_LOG_ERROR, "VULKAN: vkCreateDescriptorSetLayout set=%d failed (%d)", set, r);
     }
 }
@@ -1482,7 +1517,7 @@ static void rlvkAllocShaderUBOs(rlvkShader *s)
         if (u->shared) continue;  // shared frame UBO is owned by RLVK_STATE
 
         s->ubos[idx].shadow = (unsigned char*)RL_CALLOC(1, u->size);
-        s->ubos[idx].dirty  = 1;
+        for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) s->ubos[idx].dirty[f] = 1;
 
         for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) {
             rlvkCreateBuffer(
@@ -2909,30 +2944,46 @@ RLAPI void rlDrawRenderBatch(rlRenderBatch *batch)
             else if (mode == RL_TRIANGLES) rs.topology = 0;
             else /* RL_QUADS */ rs.topology = 0;          // indexed TRIANGLE_LIST
 
-            // Re-route texture binding to the shader's sampler table. The
-            // default shader's first sampler entry is texture0 (set=0/binding=0);
-            // we update the cached tex-id and dirty the descriptor so
-            // rlvkFlushShaderForDraw rewrites the combined-image-sampler
-            // descriptor before the bind.
+            // Bind the per-texture descriptor for set 0. tex->descriptorSet
+            // was allocated against RLVK.descriptorSetLayout, which is the
+            // SAME object as every shader's set_layouts[0] (see
+            // rlvkBuildDescriptorSetLayouts), so the bind is layout-compatible
+            // across all shaders.
+            //
+            // KNOWN LIMITATION: on MoltenVK, custom shaders with a multi-
+            // descriptor-set pipeline_layout do not reliably sample non-
+            // default textures via this binding (the parrot in
+            // shaders_color_correction renders white under BeginShaderMode).
+            // The default shader (1-set layout) and direct DrawTexture calls
+            // outside shader mode work correctly. Tasks 39-40 (custom-shader
+            // example migration) need per-draw scratch descriptor sets or
+            // VK_EXT_descriptor_indexing UPDATE_AFTER_BIND to fix; deferred.
             unsigned int texId = batch->draws[i].textureId;
             if (texId == 0) texId = RLVK_STATE.defaultTextureId;
-            if (texId != lastBoundTex) {
-                if (active_shader->bound_sampler_texids[0] != (int)texId) {
-                    active_shader->bound_sampler_texids[0] = (int)texId;
-                    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++)
-                        active_shader->sampler_descriptor_dirty[f] = 1;
-                }
-                lastBoundTex = texId;
-            }
+            VkDescriptorSet texSet = (texId < RLVK_MAX_TEXTURES && rlvkTextures[texId].active)
+                ? rlvkTextures[texId].descriptorSet
+                : RLVK.defaultTexDescriptor;
 
             VkPipeline p = rlvkGetPipeline(shader_id, RLVK_VLAYOUT_BATCH_2D, &rs);
             if (!p) continue;
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
 
-            // Flush UBOs + sampler descriptors and bind descriptor sets for
-            // the active shader. Must happen after sampler-id update above so
-            // the combined-image-sampler descriptor is rewritten if needed.
             rlvkFlushShaderForDraw(cmd, RLVK.currentFrame);
+
+            if (texId != lastBoundTex) {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    active_shader->pipeline_layout, 0, 1, &texSet, 0, NULL);
+                lastBoundTex = texId;
+            }
+
+            // Bind the shader's own UBO sets (set 1+) for shaders that
+            // declared per-shader UBOs. Set 0 was bound externally above.
+            for (int sIdx = 1; sIdx < RLVK_MAX_DESC_SETS; sIdx++) {
+                if (!active_shader->set_layout_used[sIdx]) continue;
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    active_shader->pipeline_layout, (uint32_t)sIdx, 1,
+                    &active_shader->descriptor_sets[RLVK.currentFrame][sIdx], 0, NULL);
+            }
 
             if (mode == RL_QUADS) {
                 vkCmdBindIndexBuffer(cmd, RLVK.indexBuffer, 0, VK_INDEX_TYPE_UINT32);
@@ -3215,6 +3266,33 @@ RLAPI unsigned int rlLoadTexture(const void *data, int width, int height, int fo
     rlvkTexture *tex = &rlvkTextures[id];
     VkFormat vkFormat = rlvkGetVulkanFormat(format);
     int pixelSize = rlvkGetPixelSize(format);
+
+    // VK_FORMAT_R8G8B8_UNORM (24-bit RGB) is widely unsupported (notably on
+    // MoltenVK / Apple GPUs). Expand 24-bit RGB into 32-bit RGBA (alpha=255)
+    // on the staging buffer; the GPU image becomes RGBA. This matches the
+    // OpenGL backend's behavior, where most 24-bit RGB textures are also
+    // converted on upload by the driver.
+    const unsigned char *srcData = (const unsigned char *)data;
+    unsigned char *expandedData = NULL;
+    if (format == RL_PIXELFORMAT_UNCOMPRESSED_R8G8B8) {
+        size_t pixels = (size_t)width * (size_t)height;
+        expandedData = (unsigned char *)RL_MALLOC(pixels * 4);
+        if (!expandedData) {
+            TRACELOG(RL_LOG_ERROR, "VULKAN: Out of memory expanding R8G8B8->R8G8B8A8 for %dx%d texture", width, height);
+            rlvkTextureCount--;
+            return RLVK_STATE.defaultTextureId;
+        }
+        for (size_t p = 0; p < pixels; p++) {
+            expandedData[p*4 + 0] = srcData[p*3 + 0];
+            expandedData[p*4 + 1] = srcData[p*3 + 1];
+            expandedData[p*4 + 2] = srcData[p*3 + 2];
+            expandedData[p*4 + 3] = 0xFF;
+        }
+        srcData    = expandedData;
+        vkFormat   = VK_FORMAT_R8G8B8A8_UNORM;
+        pixelSize  = 4;
+    }
+
     VkDeviceSize dataSize = (VkDeviceSize)width * height * pixelSize;
 
     // Create image
@@ -3253,7 +3331,7 @@ RLAPI unsigned int rlLoadTexture(const void *data, int width, int height, int fo
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &staging, &stagingMem);
     void *mapped;
     vkMapMemory(RLVK.device, stagingMem, 0, dataSize, 0, &mapped);
-    memcpy(mapped, data, dataSize);
+    memcpy(mapped, srcData, dataSize);
     vkUnmapMemory(RLVK.device, stagingMem);
 
     VkCommandBuffer cmd = rlvkBeginSingleTimeCommands();
@@ -3287,6 +3365,7 @@ RLAPI unsigned int rlLoadTexture(const void *data, int width, int height, int fo
     rlvkEndSingleTimeCommands(cmd);
     vkDestroyBuffer(RLVK.device, staging, NULL);
     vkFreeMemory(RLVK.device, stagingMem, NULL);
+    if (expandedData) RL_FREE(expandedData);
 
     // Image view with swizzle for special formats
     VkImageViewCreateInfo viewInfo = {
@@ -3381,7 +3460,8 @@ RLAPI void rlUnloadShaderProgram(unsigned int id)
 
     if (s->descriptor_pool) vkDestroyDescriptorPool(RLVK.device, s->descriptor_pool, NULL);
     for (int i = 0; i < RLVK_MAX_DESC_SETS; i++)
-        if (s->set_layout_used[i]) vkDestroyDescriptorSetLayout(RLVK.device, s->set_layouts[i], NULL);
+        if (s->set_layout_used[i] && s->set_layout_owned[i])
+            vkDestroyDescriptorSetLayout(RLVK.device, s->set_layouts[i], NULL);
     if (s->pipeline_layout) vkDestroyPipelineLayout(RLVK.device, s->pipeline_layout, NULL);
     if (s->vs_module) vkDestroyShaderModule(RLVK.device, s->vs_module, NULL);
     if (s->fs_module) vkDestroyShaderModule(RLVK.device, s->fs_module, NULL);
@@ -3412,6 +3492,37 @@ RLAPI int rlGetLocationAttrib(unsigned int id, const char *attribName)
     return -1;
 }
 
+// Phase 4 Task 40: walk the generated blob's reflection tables and map common
+// raylib names onto RL_SHADER_LOC_* slots. Examples that load a generated
+// shader (LoadSwirlShader, etc.) use this so they can call
+// SetShaderValue/MATERIAL_MAP_DIFFUSE etc. against the resulting Shader.locs
+// array exactly like they do on the OpenGL backend, where rlGetShaderLocsDefault
+// fills the same slots from glGetUniformLocation calls.
+RLAPI int *GetShaderLocsAuto(unsigned int shaderId)
+{
+    int *locs = (int *)RL_CALLOC(RL_MAX_SHADER_LOCATIONS, sizeof(int));
+    for (int i = 0; i < RL_MAX_SHADER_LOCATIONS; i++) locs[i] = -1;
+    if (shaderId == 0 || shaderId >= RLVK_MAX_SHADERS) return locs;
+    rlvkShader *s = &RLVK_STATE.shaders[shaderId];
+    if (!s->in_use) return locs;
+
+    static const struct { const char *n; int loc; } map[] = {
+        { "vertexPosition", RL_SHADER_LOC_VERTEX_POSITION },
+        { "vertexTexCoord", RL_SHADER_LOC_VERTEX_TEXCOORD01 },
+        { "vertexNormal",   RL_SHADER_LOC_VERTEX_NORMAL },
+        { "vertexColor",    RL_SHADER_LOC_VERTEX_COLOR },
+        { "mvp",            RL_SHADER_LOC_MATRIX_MVP },
+        { "colDiffuse",     RL_SHADER_LOC_COLOR_DIFFUSE },
+        { "texture0",       RL_SHADER_LOC_MAP_DIFFUSE },
+        { NULL, 0 }
+    };
+    for (int i = 0; map[i].n; i++) {
+        int loc = rlGetLocationUniform(shaderId, map[i].n);
+        if (loc >= 0) locs[map[i].loc] = loc;
+    }
+    return locs;
+}
+
 RLAPI void rlSetUniform(int locIndex, const void *value, int uniformType, int count)
 {
     if (locIndex < 0 || rlvkLocIsSampler(locIndex)) return;
@@ -3435,7 +3546,7 @@ RLAPI void rlSetUniform(int locIndex, const void *value, int uniformType, int co
     if ((int)ubo_idx >= s->n_ubos) return;
     if (offset + size > s->ubos[ubo_idx].size) return;
     memcpy(s->ubos[ubo_idx].shadow + offset, value, size);
-    s->ubos[ubo_idx].dirty = 1;
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) s->ubos[ubo_idx].dirty[f] = 1;
 }
 
 // raylib's Matrix struct is row-major in memory (raymath.h:6 and the field
@@ -3476,7 +3587,7 @@ RLAPI void rlSetUniformMatrix(int locIndex, Matrix mat)
     if ((int)ubo_idx >= s->n_ubos) return;
     if (offset + 64 > s->ubos[ubo_idx].size) return;
     rlvkWriteMat4ColMajor(s->ubos[ubo_idx].shadow + offset, mat);
-    s->ubos[ubo_idx].dirty = 1;
+    for (int f = 0; f < RLVK_MAX_FRAMES_IN_FLIGHT; f++) s->ubos[ubo_idx].dirty[f] = 1;
 }
 
 RLAPI void rlSetUniformMatrices(int locIndex, const Matrix *mat, int count)
@@ -3604,20 +3715,12 @@ static void rlvkFlushShaderForDraw(VkCommandBuffer cmd, uint32_t frame)
     // Upload dirty per-shader UBOs via persistently-mapped buffers.
     for (int i = 0; i < s->n_ubos; i++) {
         if (s->ubos[i].shared) continue;  // shared frame UBO handled above
-        if (!s->ubos[i].dirty) continue;
+        if (!s->ubos[i].dirty[frame]) continue;
         memcpy(s->ubos[i].mapped[frame], s->ubos[i].shadow, s->ubos[i].size);
-        s->ubos[i].dirty = 0;
+        s->ubos[i].dirty[frame] = 0;
     }
-    rlvkFlushSamplerDescriptors(s, frame);
-
-    // Bind any used descriptor sets (Phase 4 assumes contiguous from set 0).
-    VkDescriptorSet sets[RLVK_MAX_DESC_SETS]; uint32_t n = 0;
-    for (int i = 0; i < RLVK_MAX_DESC_SETS; i++) {
-        if (!s->set_layout_used[i]) break;
-        sets[n++] = s->descriptor_sets[frame][i];
-    }
-    if (n) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-        s->pipeline_layout, 0, n, sets, 0, NULL);
+    // (Set bindings happen in rlDrawRenderBatch in a single
+    //  vkCmdBindDescriptorSets call — see notes there.)
 
     // Apply scissor (dynamic). Falls back to full framebuffer when disabled.
     VkRect2D sc = RLVK_STATE.scissor_enabled
