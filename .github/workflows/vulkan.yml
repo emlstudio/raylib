@@ -65,13 +65,22 @@ jobs:
       - name: Install Vulkan SDK (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install molten-vk shaderc glslang
-          # Surface VULKAN_SDK so the Makefile picks up include / lib paths.
-          # Homebrew installs molten-vk under /opt/homebrew on Apple Silicon
-          # and /usr/local on Intel; both expose vulkan headers at $PREFIX/include.
-          PREFIX="$(brew --prefix molten-vk)"
-          echo "VULKAN_SDK=$PREFIX" >> $GITHUB_ENV
-          echo "DYLD_LIBRARY_PATH=$PREFIX/lib" >> $GITHUB_ENV
+          # Install all four pieces individually — brew's `molten-vk` formula
+          # ships only the MoltenVK driver, NOT the Vulkan loader / headers /
+          # glslc, which we need to compile rcore.c (#include <vulkan/vulkan.h>)
+          # and to run rlvk-shdc fixture tests (glslc invocation in the
+          # tests/run_tests.sh).
+          brew install molten-vk vulkan-headers vulkan-loader shaderc glslang
+          BREW_PREFIX="$(brew --prefix)"
+          # Make headers and libs visible to clang/ld without touching the
+          # Makefile (CPATH / LIBRARY_PATH are honored automatically).
+          echo "CPATH=$BREW_PREFIX/include" >> $GITHUB_ENV
+          echo "LIBRARY_PATH=$BREW_PREFIX/lib" >> $GITHUB_ENV
+          # Surface VULKAN_SDK for any path that explicitly checks the env
+          # var; point it at the brew prefix so $VULKAN_SDK/include and
+          # $VULKAN_SDK/lib resolve to the right places.
+          echo "VULKAN_SDK=$BREW_PREFIX" >> $GITHUB_ENV
+          echo "DYLD_LIBRARY_PATH=$BREW_PREFIX/lib" >> $GITHUB_ENV
 
       # ──────────────────────────────────────────────────────────────────
       # Build: libraylib + rlvk-shdc + tool fixtures

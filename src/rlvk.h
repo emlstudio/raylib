@@ -653,14 +653,15 @@ RLAPI void rlLoadDrawQuad(void);
 //----------------------------------------------------------------------------------
 #if defined(RLVK_IMPLEMENTATION)
 
-#include <stdlib.h>
-#include <string.h>
+#include <stdio.h>      // FILE, fopen, fread, fwrite, fseek, ftell, snprintf
+#include <stdlib.h>     // getenv, malloc, free, exit
+#include <string.h>     // memcpy, memset, strcmp, strncpy
 #include <math.h>
 
 #if defined(_WIN32)
-    #include <direct.h>
+    #include <direct.h>     // _mkdir
 #else
-    #include <sys/stat.h>
+    #include <sys/stat.h>   // mkdir
     #include <sys/types.h>
 #endif
 
