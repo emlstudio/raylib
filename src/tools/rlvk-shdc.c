@@ -46,6 +46,13 @@ static void usage(const char *argv0)
 
 #define SPV_MAGIC 0x07230203u
 
+// Maximum SPIR-V result-ID we can index. Defined here (rather than alongside
+// the reflection structures below) so spirv_check_header can validate the
+// module's declared id-bound up front and fail loudly instead of silently
+// truncating decorations on high-numbered ids.
+#define MAX_IDS   8192
+#define MAX_MEM   256    // members per struct
+
 static uint32_t *load_file_u32(const char *path, size_t *words_out)
 {
     FILE *f = fopen(path, "rb");
@@ -54,11 +61,18 @@ static uint32_t *load_file_u32(const char *path, size_t *words_out)
     long sz = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (sz <= 0 || (sz % 4) != 0) {
+        fclose(f);
         fprintf(stderr, "rlvk-shdc: %s: not a 4-byte-aligned file\n", path);
         exit(1);
     }
     uint32_t *buf = (uint32_t*)malloc((size_t)sz);
+    if (!buf) {
+        fclose(f);
+        fprintf(stderr, "rlvk-shdc: out of memory loading %s\n", path);
+        exit(1);
+    }
     if (fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf); fclose(f);
         fprintf(stderr, "rlvk-shdc: short read on %s\n", path);
         exit(1);
     }
@@ -73,7 +87,13 @@ static void spirv_check_header(const uint32_t *w, size_t n, const char *path)
         fprintf(stderr, "rlvk-shdc: %s: bad SPIR-V magic\n", path);
         exit(1);
     }
-    // w[3] = id bound, w[4] = reserved schema (must be 0)
+    // w[3] is the upper-bound on IDs used in the module (per SPIR-V spec).
+    if (w[3] > MAX_IDS) {
+        fprintf(stderr, "rlvk-shdc: %s declares %u IDs, exceeds MAX_IDS=%d. "
+                "Bump MAX_IDS in rlvk-shdc.c.\n", path, w[3], MAX_IDS);
+        exit(1);
+    }
+    // w[4] = reserved schema (must be 0)
 }
 
 typedef void (*spv_visitor)(uint16_t opcode, uint16_t wc, const uint32_t *ins, void *ctx);
@@ -97,9 +117,6 @@ static void spirv_walk(const uint32_t *w, size_t n, spv_visitor v, void *ctx)
 // ---------------------------------------------------------------------------
 // Reflection data structures
 // ---------------------------------------------------------------------------
-
-#define MAX_IDS   8192
-#define MAX_MEM   256    // members per struct
 
 typedef enum { T_UNKNOWN, T_INT, T_UINT, T_FLOAT, T_VEC, T_MAT,
                T_STRUCT, T_POINTER, T_ARRAY, T_IMAGE, T_SAMPLED_IMAGE } spv_kind;
@@ -150,6 +167,11 @@ enum {
     DecArrayStride = 6, DecMatrixStride = 7, DecBuiltin = 11,
     DecLocation = 30, DecBinding = 33, DecDescriptorSet = 34,
     DecOffset = 35
+};
+enum {
+    SC_UniformConstant = 0,
+    SC_Uniform         = 2,
+    SC_PushConstant    = 9
 };
 
 // Constants stash for array lengths (used by OpTypeArray)
@@ -314,7 +336,8 @@ static int ubo_combined_add(ubo_combined *out, int *n,
         }
     }
     if (*n >= MAX_UBOS) return -2;
-    out[*n] = (ubo_combined){ set, binding, size, type_id, from_vs, !from_vs };
+    out[*n] = (ubo_combined){ .set = set, .binding = binding, .size = size,
+                              .type_id = type_id, .in_vs = from_vs, .in_fs = !from_vs };
     return (*n)++;
 }
 
@@ -325,7 +348,7 @@ static int collect_ubos(const spv_reflect *R, ubo_combined *out, int *n, int fro
         const spv_var *v = &R->vars[id];
         const spv_type *ptr = &R->types[v->type_id];
         if (ptr->kind != T_POINTER) continue;
-        if (ptr->storage_class != 2 /*Uniform*/) continue;
+        if (ptr->storage_class != SC_Uniform) continue;
         uint32_t struct_id = ptr->elem_id;
         if (!R->has_block[struct_id]) continue;
         if (!v->has_set || !v->has_binding) continue;
@@ -362,7 +385,7 @@ static int collect_samplers(const spv_reflect *R, sampler_ent *out, int *n)
         const spv_var *v = &R->vars[id];
         const spv_type *ptr = &R->types[v->type_id];
         if (ptr->kind != T_POINTER) continue;
-        if (ptr->storage_class != 0 /*UniformConstant*/) continue;
+        if (ptr->storage_class != SC_UniformConstant) continue;
         const spv_type *elem = &R->types[ptr->elem_id];
         if (elem->kind != T_SAMPLED_IMAGE && elem->kind != T_IMAGE) continue;
         if (!v->has_set || !v->has_binding) continue;
@@ -448,10 +471,15 @@ static void emit_uniforms(FILE *out, const char *prefix,
             uint8_t count = 1;
             int type = rl_uniform_type(R, st->members[m], &count);
             if (type < 0) {
-                // Matrix special case: type=0 (FLOAT), count=cols (so location math
-                // can address a mat4 as 64 bytes). Anything else: skip.
+                // Matrix special case: emit synthetic type=0xFE
+                // (RLVK_SHADER_UNIFORM_MAT) so the runtime knows this entry is
+                // `cols` columns of vec4 (std140 layout) -> `count * 16` bytes
+                // total, not a `count`-element float array. Anything else: skip.
                 const spv_type *t = &R->types[st->members[m]];
-                if (t->kind == T_MAT) { type = 0; count = (uint8_t)t->cols; }
+                if (t->kind == T_MAT) {
+                    type = 0xFE; // RLVK_SHADER_UNIFORM_MAT - runtime: count cols x 16 bytes
+                    count = (uint8_t)t->cols;
+                }
                 else continue;
             }
             fprintf(out, "    { \"%s\", %d, %u, %d, %u },\n",

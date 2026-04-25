@@ -36,6 +36,12 @@
 // rlvk-shdc emits those values as integer literals so generated headers do
 // not require including raylib.h or rlgl.h.
 
+// rlvk-shdc emits this synthetic type value for matrix members so runtime
+// distinguishes them from float arrays of the same `count`. Runtime should
+// treat the entry as `count` columns of vec4 (std140 layout) -> `count * 16`
+// bytes total.
+#define RLVK_SHADER_UNIFORM_MAT   ((uint8_t)0xFE)
+
 #define RLVK_MAX_UBOS_PER_SHADER  8
 #define RLVK_MAX_DESC_SETS        4
 #define RLVK_FRAME_UBO_INDEX      0x7F  // sentinel value in ubo_index for shared frame UBO
